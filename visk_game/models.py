@@ -146,6 +146,8 @@ class Debris:
     y: int
     ch: str
     origin: str
+    created_at: float = 0.0
+    fade_duration: float = 7.5
 
 
 @dataclass
@@ -255,6 +257,7 @@ class SaveData:
     banked_bytes: int = 0
     streak: int = 0
     hardcore: bool = False
+    audio_enabled: bool = True
     upgrades: dict[str, int] = field(
         default_factory=lambda: {
             "dash_cache": 0,
@@ -263,6 +266,20 @@ class SaveData:
             "focus": 0,
         }
     )
+
+
+@dataclass
+class CreditsState:
+    body: deque[Segment]
+    direction: str = "right"
+    pending_command: str = ""
+    direction_undos: list[tuple[int, str, str]] = field(default_factory=list)
+    width: int = 44
+    height: int = 14
+
+    @property
+    def head(self) -> Segment:
+        return self.body[-1]
 
 
 @dataclass

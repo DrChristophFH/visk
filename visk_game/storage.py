@@ -17,6 +17,7 @@ def load_save() -> SaveData:
     data.banked_bytes = int(raw.get("banked_bytes", 0))
     data.streak = int(raw.get("streak", 0))
     data.hardcore = bool(raw.get("hardcore", False))
+    data.audio_enabled = bool(raw.get("audio_enabled", True))
     upgrades = raw.get("upgrades", {})
     for key in data.upgrades:
         data.upgrades[key] = int(upgrades.get(key, 0))
@@ -28,6 +29,7 @@ def save_save(data: SaveData) -> None:
         "banked_bytes": data.banked_bytes,
         "streak": data.streak,
         "hardcore": data.hardcore,
+        "audio_enabled": data.audio_enabled,
         "upgrades": data.upgrades,
     }
     SAVE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -26,11 +26,12 @@ def wreckage_positions(run: RunState) -> set[tuple[int, int]]:
 
 def add_wreckage(run: RunState, segments: list[Segment], origin: str) -> None:
     occupied = wreckage_positions(run)
+    now = time.monotonic()
     for segment in segments:
         pos = (segment.x, segment.y)
         if pos in occupied:
             continue
-        run.wreckage.append(Debris(segment.x, segment.y, segment.ch or " ", origin))
+        run.wreckage.append(Debris(segment.x, segment.y, segment.ch or " ", origin, created_at=now))
         occupied.add(pos)
 
 
@@ -200,13 +201,12 @@ def remove_player_segments_in_zone(run: RunState, impact_zone: set[tuple[int, in
 def remove_enemy_segments_in_zone(run: RunState, enemy: Enemy, impact_zone: set[tuple[int, int]], reason: str) -> None:
     if enemy.dead:
         return
-    survivors = deque(segment for segment in enemy.body if (segment.x, segment.y) not in impact_zone)
-    if len(survivors) == len(enemy.body):
+    if not any((segment.x, segment.y) in impact_zone for segment in enemy.body):
         return
-    if not survivors:
-        kill_enemy_with_wreckage(run, enemy, reason, leave_wreckage=False)
-        return
-    enemy.body = survivors
+    remaining_segments = [segment for segment in enemy.body if (segment.x, segment.y) not in impact_zone]
+    if remaining_segments:
+        add_wreckage(run, remaining_segments, enemy.kind)
+    kill_enemy_with_wreckage(run, enemy, reason, leave_wreckage=False)
 
 
 def apply_explosion(run: RunState, x: int, y: int, radius: int, owner: str) -> None:

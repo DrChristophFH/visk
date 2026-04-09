@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 SAVE_PATH = Path(__file__).resolve().parent.parent / "visk_save.json"
 CHUNK_SIZE = 28
 GENERATION_RADIUS = 2
@@ -16,13 +15,20 @@ DIRECTIONS = {
 }
 
 ABILITY_NAMES = ("zap", "bomb", "mine", "silence", "ping", "dash")
-SECTOR_NAMES = ("MAINFRAME", "ARCHIVE", "SUBROUTINE", "BLACKSITE", "NULLNET", "SECTOR-7")
+SECTOR_NAMES = (
+    "MAINFRAME",
+    "ARCHIVE",
+    "SUBROUTINE",
+    "BLACKSITE",
+    "NULLNET",
+    "SECTOR-7",
+)
 THEMES = (
     {
         "name": "noir",
         "bg": (10, 10, 12),
         "bg_alt": (14, 14, 17),
-        "wall": (78, 79, 88),
+        "wall": (88, 89, 98),
         "floor": (12, 12, 14),
         "player": (235, 236, 241),
         "player_pending": (208, 212, 222),
@@ -71,4 +77,28 @@ SHOP_ITEMS = (
         "description": "Reduce BLINDER duration by 3 turns per level.",
         "base_cost": 130,
     },
+)
+
+CREDITS_PAGE_LINES = (
+    ("CREDITS", "pickup", True),
+    ("", "player", False),
+    ("Typing sounds", "pickup", True),
+    ("mechvibes by hainguyents13", "player", False),
+    ("https://github.com/hainguyents13/mechvibes", "muted", False),
+    ("", "player", False),
+    ("Soundtrack", "pickup", True),
+    ("Trevor Lentz", "player", False),
+    ("Main menu: Arcade", "player", False),
+    ("In-game: Echoes of Eternity", "player", False),
+    (
+        "Spotify: https://open.spotify.com/artist/3AjWA7sRmeZSKqr7PoKL6k",
+        "muted",
+        False,
+    ),
+    ("", "player", False),
+    (
+        "Type to move. Spell UP, DOWN, LEFT, RIGHT to turn. Type EXIT or MENU to return.",
+        "accent",
+        False,
+    ),
 )
