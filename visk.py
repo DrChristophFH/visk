@@ -222,6 +222,14 @@ class Segment:
 
 
 @dataclass
+class Debris:
+    x: int
+    y: int
+    ch: str
+    origin: str
+
+
+@dataclass
 class Pickup:
     x: int
     y: int
@@ -229,6 +237,8 @@ class Pickup:
     ability: str
     failed: bool = False
     resolved: bool = False
+    matched_indices: set[int] = field(default_factory=set)
+    error_indices: set[int] = field(default_factory=set)
 
     def cells(self) -> list[tuple[int, int]]:
         return [(self.x + i, self.y) for i in range(len(self.text))]
@@ -248,6 +258,7 @@ class Bomb:
     fuse: int
     radius: int
     owner: str = "player"
+    cells: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -255,6 +266,15 @@ class Mine:
     x: int
     y: int
     radius: int = 1
+
+
+@dataclass
+class ExplosionEffect:
+    x: int
+    y: int
+    radius: int
+    started_at: float
+    duration: float
 
 
 @dataclass
@@ -326,6 +346,8 @@ class RunState:
     silence_ticks: int = 0
     bombs: list[Bomb] = field(default_factory=list)
     mines: list[Mine] = field(default_factory=list)
+    wreckage: list[Debris] = field(default_factory=list)
+    explosions: list[ExplosionEffect] = field(default_factory=list)
     messages: deque[str] = field(default_factory=lambda: deque(maxlen=6))
     pickup_attempt: PickupAttempt | None = None
     game_over: bool = False
@@ -343,6 +365,38 @@ class RunState:
 
     def log(self, message: str) -> None:
         self.messages.appendleft(message)
+
+
+def active_enemy_limit(run: RunState) -> int:
+    return 2 + run.ticks // 90
+
+
+def active_enemies_for_run(run: RunState) -> list[Enemy]:
+    living = [enemy for enemy in run.sector.enemies if not enemy.dead]
+    return living[: active_enemy_limit(run)]
+
+
+def wreckage_positions(run: RunState) -> set[tuple[int, int]]:
+    return {(piece.x, piece.y) for piece in run.wreckage}
+
+
+def add_wreckage(run: RunState, segments: list[Segment], origin: str) -> None:
+    occupied = wreckage_positions(run)
+    for segment in segments:
+        pos = (segment.x, segment.y)
+        if pos in occupied:
+            continue
+        run.wreckage.append(Debris(segment.x, segment.y, segment.ch or " ", origin))
+        occupied.add(pos)
+
+
+def show_run_help(run: RunState) -> None:
+    run.log("Action keys are ticks. Type direction words inline to turn, ability names inline to execute, BACKSPACE to rewind; SPACE does nothing.")
+
+
+def show_run_status(run: RunState) -> None:
+    stocked = " ".join(f"{name}:{run.inventory.get(name, 0)}" for name in ABILITY_NAMES if run.inventory.get(name, 0))
+    run.log(f"Status dir={run.direction.upper()} bytes={run.bytes_collected} inv={stocked or 'none'}.")
 
 
 SHOP_ITEMS = (
@@ -736,7 +790,7 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
         sector.byte_shards.append(ByteShard(point[0], point[1], rng.randint(24, 68)))
         occupied.add(point)
 
-    enemy_total = 0 if near_start else rng.randint(0, 1)
+    enemy_total = 0 if near_start else (1 if rng.random() < 0.2 else 0)
     for _ in range(enemy_total):
         length = rng.randint(4, 7)
         point = sample_chunk_floor(rng, sector, cx, cy, occupied, width=length)
@@ -897,12 +951,38 @@ def create_run(save: SaveData) -> RunState:
     inventory["ping"] += save.upgrades["ping_cache"]
     run = RunState(sector=sector, body=body, direction="right", inventory=inventory, hardcore=save.hardcore)
     run.log(f"Link established. Sector {sector.name}.")
-    run.log("Type a command, then press ENTER. Directions move; ability names execute.")
+    show_run_help(run)
     return run
 
 
 def body_positions(body: deque[Segment]) -> set[tuple[int, int]]:
     return {(segment.x, segment.y) for segment in body}
+
+
+def trim_player_history(run: RunState, retained_start: int, reason: str) -> None:
+    if retained_start <= 0:
+        return
+    body_segments = list(run.body)
+    removed_segments = body_segments[:retained_start]
+    kept_segments = body_segments[retained_start:]
+    if not kept_segments:
+        kept_segments = [run.head]
+    if removed_segments:
+        add_wreckage(run, removed_segments, "player")
+    run.body = deque(kept_segments)
+    run.pending_command = run.pending_command[-max(0, len(run.body) - 1) :]
+    adjusted_undos: list[tuple[int, str, str]] = []
+    for step_index, previous_direction, previous_pending in run.direction_undos:
+        new_step = step_index - retained_start
+        if new_step > 0:
+            adjusted_undos.append((new_step, previous_direction, previous_pending[-max(0, new_step) :]))
+    run.direction_undos = adjusted_undos
+    if run.pickup_attempt is not None:
+        pickup = run.sector.pickups[run.pickup_attempt.pickup_index]
+        pickup.failed = True
+        run.pickup_attempt = None
+        run.log(f"{pickup.text.upper()} lost on {reason}.")
+    run.log(f"Trail cut by {reason.upper()}.")
 
 
 def step_from_direction(direction: str) -> tuple[int, int]:
@@ -919,8 +999,116 @@ def enemy_positions(enemies: list[Enemy]) -> set[tuple[int, int]]:
     return cells
 
 
+def debris_color(theme: dict[str, tuple[int, int, int] | str], origin: str) -> tuple[int, int, int]:
+    if origin == "player":
+        return mix(theme["player"], theme["muted"], 0.55)
+    return mix(theme["enemy"], theme["wall"], 0.45)
+
+
+def pickup_letter_color(theme: dict[str, tuple[int, int, int] | str], pickup: Pickup, index: int) -> tuple[int, int, int]:
+    if index in pickup.error_indices:
+        return theme["enemy"]
+    if index in pickup.matched_indices:
+        return mix(theme["bytes"], theme["player"], 0.3)
+    if pickup.failed:
+        return mix(theme["enemy"], theme["muted"], 0.35)
+    return theme["pickup"]
+
+
+def pickup_color_at_position(
+    theme: dict[str, tuple[int, int, int] | str],
+    run: RunState,
+    position: tuple[int, int],
+) -> tuple[int, int, int] | None:
+    for pickup in run.sector.pickups:
+        if pickup.resolved:
+            continue
+        for index, cell in enumerate(pickup.cells()):
+            if cell != position:
+                continue
+            if index in pickup.matched_indices or index in pickup.error_indices or pickup.failed:
+                return pickup_letter_color(theme, pickup, index)
+            return None
+    return None
+
+
+def player_segment_color(
+    theme: dict[str, tuple[int, int, int] | str],
+    index: int,
+    body_length: int,
+    *,
+    infected: bool,
+    pickup_color: tuple[int, int, int] | None = None,
+) -> tuple[int, int, int]:
+    if pickup_color is not None:
+        color = pickup_color
+    else:
+        fade_cap = 0.78
+        if body_length <= 1:
+            color = theme["player"]
+        else:
+            recentness = index / max(1, body_length - 1)
+            fade_amount = (1.0 - recentness) * fade_cap
+            color = mix(theme["player"], theme["muted"], fade_amount)
+    if infected:
+        color = mix(color, theme["enemy"], 0.6)
+    return color
+
+
+def bomb_display_cells(bomb: Bomb) -> list[tuple[int, int, str]]:
+    countdown = str(max(0, bomb.fuse))
+    if len(bomb.cells) == 4:
+        glyphs = ("b", countdown, "m", "b")
+        return [(cell[0], cell[1], glyph) for cell, glyph in zip(bomb.cells, glyphs)]
+    return [(bomb.x, bomb.y, countdown)]
+
+
+def bomb_text_color(theme: dict[str, tuple[int, int, int] | str]) -> tuple[int, int, int]:
+    return mix(theme["enemy"], (255, 150, 150), 0.25)
+
+
+def active_explosions(run: RunState, *, now: float | None = None) -> list[ExplosionEffect]:
+    now = time.monotonic() if now is None else now
+    active = [effect for effect in run.explosions if now - effect.started_at < effect.duration]
+    run.explosions = active
+    return active
+
+
+def explosion_visual(
+    effect: ExplosionEffect,
+    wx: int,
+    wy: int,
+    tick_seed: int,
+    *,
+    now: float,
+) -> tuple[str, tuple[int, int, int], tuple[int, int, int]] | None:
+    palette = (
+        (70, 0, 0),
+        (120, 8, 0),
+        (170, 24, 0),
+        (220, 60, 0),
+        (255, 120, 18),
+    )
+    elapsed = max(0.0, now - effect.started_at)
+    progress = min(1.0, elapsed / max(0.001, effect.duration))
+    wave_radius = progress * (effect.radius + 0.9)
+    distance = abs(wx - effect.x) + abs(wy - effect.y)
+    if distance > effect.radius or distance > wave_radius:
+        return None
+    front_gap = max(0.0, wave_radius - distance)
+    front_strength = max(0.0, 1.0 - min(1.0, front_gap / 1.25))
+    fade = 1.0 - progress
+    palette_index = clamp(int((front_strength * 3.2 + fade * 1.6) * (len(palette) - 1)), 0, len(palette) - 1)
+    noise = hash_noise(wx, wy, tick_seed + int(progress * 1000))
+    bg_color = palette[palette_index]
+    glyphs = " .:*x"
+    ch = glyphs[(noise // 5 + int(progress * 10)) % len(glyphs)]
+    fg_color = mix((255, 235, 190), bg_color, 0.18)
+    return ch, fg_color, bg_color
+
+
 def closest_enemy(run: RunState) -> Enemy | None:
-    living = [enemy for enemy in run.sector.enemies if not enemy.dead]
+    living = active_enemies_for_run(run)
     if not living:
         return None
     return min(living, key=lambda enemy: manhattan((enemy.head.x, enemy.head.y), (run.head.x, run.head.y)))
@@ -930,28 +1118,37 @@ def kill_enemy(run: RunState, enemy: Enemy, reason: str) -> None:
     if enemy.dead:
         return
     enemy.dead = True
+    add_wreckage(run, list(enemy.body), enemy.kind)
     run.kills += 1
     run.bytes_collected += 40
     run.log(f"{enemy.kind.upper()} deleted via {reason}. +40 bytes.")
 
 
 def apply_explosion(run: RunState, x: int, y: int, radius: int, owner: str) -> None:
-    player_cells = body_positions(run.body)
-    if any(abs(px - x) + abs(py - y) <= radius for px, py in player_cells):
+    run.explosions.append(ExplosionEffect(x, y, radius, started_at=time.monotonic(), duration=0.95))
+    hit_indices = [
+        index
+        for index, segment in enumerate(run.body)
+        if abs(segment.x - x) + abs(segment.y - y) <= radius
+    ]
+    if hit_indices and hit_indices[-1] == len(run.body) - 1:
         run.game_over = True
         run.cause = "exploded"
-    for enemy in run.sector.enemies:
+    elif hit_indices:
+        trim_player_history(run, hit_indices[-1] + 1, owner)
+    for enemy in active_enemies_for_run(run):
         if enemy.dead:
             continue
         if any(abs(segment.x - x) + abs(segment.y - y) <= radius for segment in enemy.body):
             kill_enemy(run, enemy, owner.upper())
 
 
-def update_hazards(run: RunState) -> None:
+def update_hazards(run: RunState, *, advance_bombs: bool) -> None:
     remaining_bombs: list[Bomb] = []
     for bomb in run.bombs:
-        bomb.fuse -= 1
-        if bomb.fuse <= 0:
+        if advance_bombs:
+            bomb.fuse -= 1
+        if bomb.fuse < 0:
             apply_explosion(run, bomb.x, bomb.y, bomb.radius, bomb.owner)
             run.log(f"{bomb.owner.upper()} bomb detonated.")
         else:
@@ -961,7 +1158,7 @@ def update_hazards(run: RunState) -> None:
     remaining_mines: list[Mine] = []
     for mine in run.mines:
         triggered = False
-        for enemy in run.sector.enemies:
+        for enemy in active_enemies_for_run(run):
             if enemy.dead:
                 continue
             if manhattan((mine.x, mine.y), (enemy.head.x, enemy.head.y)) <= mine.radius:
@@ -999,8 +1196,11 @@ def use_ability(run: RunState, name: str) -> None:
             return
         kill_enemy(run, enemy, "zap")
     elif name == "bomb":
-        run.bombs.append(Bomb(run.head.x, run.head.y, fuse=4, radius=2))
-        run.log("BOMB armed. Fuse: 4.")
+        recent_segments = list(run.body)[-4:]
+        bomb_cells = tuple((segment.x, segment.y) for segment in recent_segments) if len(recent_segments) == 4 else ()
+        center = bomb_cells[1] if len(bomb_cells) == 4 else (run.head.x, run.head.y)
+        run.bombs.append(Bomb(center[0], center[1], fuse=6, radius=2, cells=bomb_cells))
+        run.log("BOMB armed. Fuse: 5.")
     elif name == "mine":
         run.mines.append(Mine(run.head.x, run.head.y))
         run.log("MINE deployed.")
@@ -1013,7 +1213,7 @@ def use_ability(run: RunState, name: str) -> None:
         min_y = min(run.head.y, run.sector.exit[1]) - 18
         max_y = max(run.head.y, run.sector.exit[1]) + 18
         ensure_generated_rect(run.sector, min_x, min_y, max_x - min_x, max_y - min_y)
-        blocked = enemy_positions(run.sector.enemies) | body_positions(run.body)
+        blocked = enemy_positions(active_enemies_for_run(run)) | body_positions(run.body) | wreckage_positions(run)
         blocked.discard((run.head.x, run.head.y))
         run.ping_path = bfs_world(
             (run.head.x, run.head.y),
@@ -1025,7 +1225,7 @@ def use_ability(run: RunState, name: str) -> None:
         run.ping_ticks = 18
         run.log("PING resolved route to extraction.")
     elif name == "dash":
-        blockers = body_positions(run.body) | enemy_positions(run.sector.enemies)
+        blockers = body_positions(run.body) | enemy_positions(active_enemies_for_run(run)) | wreckage_positions(run)
         blockers.discard((run.head.x, run.head.y))
         target = line_of_floor(run.sector, run.head.x, run.head.y, 4, run.direction, blockers)
         if target == (run.head.x, run.head.y):
@@ -1076,6 +1276,8 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
         )
         if current_pickup_index != run.pickup_attempt.pickup_index or current_index != expected_index:
             pickup.failed = True
+            if current_pickup_index == run.pickup_attempt.pickup_index and current_index is not None:
+                pickup.error_indices.add(current_index)
             run.log(f"{pickup.text.upper()} lost in transit.")
             run.pickup_attempt = None
             return True
@@ -1089,13 +1291,16 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
         valid_start = (not reverse and current_index == 0) or (reverse and current_index == len(pickup.text) - 1)
         if not valid_start:
             pickup.failed = True
+            pickup.error_indices.add(current_index)
             run.log(f"{pickup.text.upper()} corrupted.")
             return True
         expected = pickup.text[current_index]
         if typed_char.lower() != expected:
             pickup.failed = True
+            pickup.error_indices.add(current_index)
             run.log(f"{pickup.text.upper()} mistyped and purged.")
             return True
+        pickup.matched_indices.add(current_index)
         run.pickup_attempt = PickupAttempt(current_pickup_index, reverse, 1)
         if len(pickup.text) == 1:
             pickup.resolved = True
@@ -1107,9 +1312,11 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
     expected = pickup.text[current_index]
     if typed_char.lower() != expected:
         pickup.failed = True
+        pickup.error_indices.add(current_index)
         run.pickup_attempt = None
         run.log(f"{pickup.text.upper()} mistyped and purged.")
         return True
+    pickup.matched_indices.add(current_index)
     run.pickup_attempt.progress += 1
     if run.pickup_attempt.progress >= len(pickup.text):
         pickup.resolved = True
@@ -1123,15 +1330,19 @@ def resolve_inline_command(run: RunState) -> None:
     if not run.pending_command:
         return
     suffix = run.pending_command.lower()
-    commands = sorted((*ABILITY_NAMES, *DIRECTIONS.keys()), key=len, reverse=True)
+    commands = sorted(("status", "help", *ABILITY_NAMES, *DIRECTIONS.keys()), key=len, reverse=True)
     for command in commands:
         if not suffix.endswith(command):
             continue
         if command in DIRECTIONS:
             run.direction_undos.append((len(run.body), run.direction, run.pending_command[:-1]))
             run.direction = command
-        else:
+        elif command in ABILITY_NAMES:
             use_ability(run, command)
+        elif command == "help":
+            show_run_help(run)
+        else:
+            show_run_status(run)
         run.pending_command = ""
         return
 
@@ -1155,7 +1366,11 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
         run.game_over = True
         run.cause = "self collision"
         return
-    if next_pos in enemy_positions(run.sector.enemies):
+    if next_pos in wreckage_positions(run):
+        run.game_over = True
+        run.cause = "wreckage collision"
+        return
+    if next_pos in enemy_positions(active_enemies_for_run(run)):
         run.game_over = True
         run.cause = "enemy collision"
         return
@@ -1195,28 +1410,6 @@ def retract_player(run: RunState) -> None:
         run.pickup_attempt = None
 
 
-def submit_command(run: RunState) -> None:
-    command = run.pending_command.strip().lower()
-    if run.pickup_attempt is not None:
-        pickup = run.sector.pickups[run.pickup_attempt.pickup_index]
-        pickup.failed = True
-        run.pickup_attempt = None
-        run.log(f"{pickup.text.upper()} lost on submit.")
-    if not command:
-        run.log("Blank command submitted.")
-        return
-    if command in DIRECTIONS:
-        run.direction = command
-        run.log(f"Direction changed to {command.upper()}.")
-    elif command in ABILITY_NAMES:
-        use_ability(run, command)
-    elif command in ("help", "status"):
-        run.log("Commands: directions move, ability names execute. Press ENTER to submit.")
-    else:
-        run.log(f"Unknown command: {command.upper()}.")
-    run.pending_command = ""
-
-
 def resolve_enemy_step(
     run: RunState,
     enemy: Enemy,
@@ -1229,12 +1422,13 @@ def resolve_enemy_step(
         if target_cells:
             target_segment = min(target_cells, key=lambda segment: manhattan((segment.x, segment.y), (enemy.head.x, enemy.head.y)))
             target = (target_segment.x, target_segment.y)
+    own_cells = {(segment.x, segment.y) for segment in enemy.body}
     candidates: list[tuple[int, int]] = []
     for direction in DIRECTIONS.values():
         nxt = enemy.head.x + direction[0], enemy.head.y + direction[1]
         if chunk_coords(nxt[0], nxt[1], run.sector.chunk_size) not in run.sector.generated_chunks:
             continue
-        if nxt in run.sector.walls or nxt in occupied:
+        if nxt in run.sector.walls or nxt in occupied or nxt in own_cells:
             continue
         candidates.append(nxt)
     if not candidates:
@@ -1250,10 +1444,13 @@ def resolve_enemy_effects(run: RunState, enemy: Enemy, save: SaveData) -> None:
     if enemy.dead:
         return
     head = (enemy.head.x, enemy.head.y)
-    player_cells = body_positions(run.body)
-    if head in player_cells:
+    trail_hits = [index for index, segment in enumerate(run.body) if (segment.x, segment.y) == head]
+    if trail_hits and trail_hits[-1] == len(run.body) - 1:
         run.game_over = True
-        run.cause = f"{enemy.kind} reached your trail"
+        run.cause = f"{enemy.kind} reached your cursor"
+        return
+    if trail_hits:
+        trim_player_history(run, trail_hits[-1] + 1, enemy.kind)
         return
 
     if enemy.kind == "virus":
@@ -1287,24 +1484,37 @@ def advance_enemies(run: RunState, save: SaveData, rng: random.Random, *, grow: 
         return
 
     ensure_generated_around(run.sector, (run.head.x, run.head.y), GENERATION_RADIUS)
-    active_enemies = [enemy for enemy in run.sector.enemies if not enemy.dead]
-    occupied = run.sector.walls | body_positions(run.body)
+    active_enemies = active_enemies_for_run(run)
+    occupied = run.sector.walls | body_positions(run.body) | wreckage_positions(run)
     for enemy in active_enemies:
+        if enemy.dead:
+            continue
         for segment in enemy.body:
             occupied.add((segment.x, segment.y))
 
     for enemy in active_enemies:
+        if enemy.dead:
+            continue
         for segment in enemy.body:
             occupied.discard((segment.x, segment.y))
         previous_head = (enemy.head.x, enemy.head.y)
         next_pos = resolve_enemy_step(run, enemy, rng, occupied)
+        if next_pos == previous_head:
+            apply_explosion(run, enemy.head.x, enemy.head.y, 1, "stuck")
+            run.log(f"{enemy.kind.upper()} locked up and exploded.")
+            for piece in run.wreckage:
+                occupied.add((piece.x, piece.y))
+            if run.game_over:
+                return
+            continue
         step_dx = next_pos[0] - enemy.head.x
         step_dy = next_pos[1] - enemy.head.y
         enemy.heading = (step_dx, step_dy)
-        enemy.body.append(Segment(next_pos[0], next_pos[1], random.choice("!$%&*+?{}[]/\\<>=")))
-        should_grow = grow and len(enemy.body) <= MAX_ENEMY_LENGTH and next_pos != previous_head
-        if not should_grow:
-            enemy.body.popleft()
+        if next_pos != previous_head:
+            enemy.body.append(Segment(next_pos[0], next_pos[1], random.choice("!$%&*+?{}[]/\\<>=")))
+            should_grow = grow and len(enemy.body) <= MAX_ENEMY_LENGTH
+            if not should_grow:
+                enemy.body.popleft()
         for segment in enemy.body:
             occupied.add((segment.x, segment.y))
         resolve_enemy_effects(run, enemy, save)
@@ -1319,6 +1529,7 @@ def decay_effects(run: RunState) -> None:
         run.ping_ticks -= 1
         if run.ping_ticks == 0:
             run.ping_path.clear()
+    active_explosions(run)
     for segment in run.body:
         if segment.infected > 0:
             segment.infected -= 1
@@ -1331,11 +1542,11 @@ def tick(run: RunState, save: SaveData, rng: random.Random, *, player_action: Ca
         player_action()
     if run.game_over:
         return
-    update_hazards(run)
+    update_hazards(run, advance_bombs=True)
     if run.game_over:
         return
     advance_enemies(run, save, rng, grow=reason == "key")
-    update_hazards(run)
+    update_hazards(run, advance_bombs=False)
     decay_effects(run)
     run.ticks += 1
     if reason == "idle" and not run.game_over:
@@ -1486,23 +1697,6 @@ class ViskApp:
         elif key in ("m", "M", "ESC"):
             self.state = "menu"
 
-    def execute_direction_command(self, direction: str) -> None:
-        if self.run is None or self.run.game_over:
-            return
-        self.run.direction = direction
-        self.run.pending_command = ""
-        self.run.log(f"Direction changed to {direction.upper()}.")
-        for ch in direction:
-            if self.run.game_over:
-                return
-            tick(
-                self.run,
-                self.save,
-                self.rng,
-                player_action=lambda ch=ch: advance_player_with_mode(self.run, ch, record_command=False),
-                reason="key",
-            )
-
     def handle_run_key(self, key: str) -> None:
         if self.run is None or self.run.game_over:
             return
@@ -1510,18 +1704,10 @@ class ViskApp:
             self.state = "menu"
             return
         if key == "BACKSPACE":
-            if self.run.pending_command:
-                self.run.pending_command = self.run.pending_command[:-1]
+            tick(self.run, self.save, self.rng, player_action=lambda: retract_player(self.run), reason="key")
             return
-        if key == "ENTER":
-            command = self.run.pending_command.strip().lower()
-            if command in DIRECTIONS:
-                self.execute_direction_command(command)
-            elif command:
-                tick(self.run, self.save, self.rng, player_action=lambda: submit_command(self.run), reason="key")
-            return
-        if len(key) == 1 and key.isprintable():
-            self.run.pending_command += key
+        if len(key) == 1 and key.isprintable() and not key.isspace():
+            tick(self.run, self.save, self.rng, player_action=lambda key=key: advance_player(self.run, key), reason="key")
 
     def render(self) -> Canvas:
         cols, rows = shutil.get_terminal_size((120, 38))
@@ -1625,22 +1811,19 @@ class ViskApp:
         for pickup in run.sector.pickups:
             if pickup.resolved:
                 continue
-            color = theme["enemy_alt"] if pickup.failed else theme["pickup"]
-            text_value = pickup.text if not pickup.failed else "." * len(pickup.text)
-            for i, ch in enumerate(text_value):
+            for i, ch in enumerate(pickup.text):
                 if screen := on_screen(pickup.x + i, pickup.y):
-                    put(screen[0], screen[1], ch, fg_color=color, bg_color=theme["floor"])
+                    put(screen[0], screen[1], ch, fg_color=pickup_letter_color(theme, pickup, i), bg_color=theme["floor"])
 
-        for bomb in run.bombs:
-            if screen := on_screen(bomb.x, bomb.y):
-                put(screen[0], screen[1], str(max(1, bomb.fuse)), fg_color=theme["enemy"], bg_color=theme["floor"])
         for mine in run.mines:
             if screen := on_screen(mine.x, mine.y):
                 put(screen[0], screen[1], "^", fg_color=theme["accent"], bg_color=theme["floor"])
 
-        for enemy in run.sector.enemies:
-            if enemy.dead:
-                continue
+        for piece in run.wreckage:
+            if screen := on_screen(piece.x, piece.y):
+                put(screen[0], screen[1], piece.ch or " ", fg_color=debris_color(theme, piece.origin), bg_color=theme["floor"])
+
+        for enemy in active_enemies_for_run(run):
             for idx, segment in enumerate(enemy.body):
                 if screen := on_screen(segment.x, segment.y):
                     put(
@@ -1652,9 +1835,7 @@ class ViskApp:
                     )
 
         blink = int(time.monotonic() * 2.6) % 2 == 0
-        for enemy in run.sector.enemies:
-            if enemy.dead:
-                continue
+        for enemy in active_enemies_for_run(run):
             head_color = enemy_head_color(theme, enemy)
             if screen := on_screen(enemy.head.x, enemy.head.y):
                 flash_fg, flash_bg = invert_colors(head_color, theme["floor"], blink)
@@ -1662,21 +1843,43 @@ class ViskApp:
 
         for idx, segment in enumerate(run.body):
             if screen := on_screen(segment.x, segment.y):
-                color = theme["player"]
-                if segment.infected > 0:
-                    color = mix(color, theme["enemy"], 0.6)
+                pickup_color = pickup_color_at_position(theme, run, (segment.x, segment.y))
+                color = player_segment_color(
+                    theme,
+                    idx,
+                    len(run.body),
+                    infected=segment.infected > 0,
+                    pickup_color=pickup_color,
+                )
                 put(screen[0], screen[1], segment.ch or " ", fg_color=color, bg_color=theme["floor"])
+
+        for bomb in run.bombs:
+            for wx, wy, ch in bomb_display_cells(bomb):
+                if screen := on_screen(wx, wy):
+                    put(screen[0], screen[1], ch, fg_color=bomb_text_color(theme), bg_color=theme["floor"], bold=True)
 
         if screen := on_screen(run.head.x, run.head.y):
             cursor_fg, cursor_bg = invert_colors(theme["player"], theme["floor"], blink)
             put(screen[0], screen[1], arrow_for_direction(run.direction), fg_color=cursor_fg, bg_color=cursor_bg)
 
+        now = time.monotonic()
+        for effect in active_explosions(run, now=now):
+            for dy in range(-effect.radius, effect.radius + 1):
+                for dx in range(-effect.radius, effect.radius + 1):
+                    if abs(dx) + abs(dy) > effect.radius:
+                        continue
+                    wx = effect.x + dx
+                    wy = effect.y + dy
+                    if screen := on_screen(wx, wy):
+                        visual = explosion_visual(effect, wx, wy, run.ticks, now=now)
+                        if visual is None:
+                            continue
+                        ch, fg_color, bg_color = visual
+                        put(screen[0], screen[1], ch, fg_color=fg_color, bg_color=bg_color, bold=True)
+
         if cols >= 56:
             bytes_text = f"b{run.bytes_collected}"
             text(max(1, cols - len(bytes_text) - 2), 1, bytes_text, fg_color=theme["muted"])
-        if run.pending_command and rows >= 3:
-            command_text = f"cmd> {run.pending_command}"
-            text(2, rows - 2, command_text[: max(0, cols // 2)], fg_color=theme["player_pending"])
         if cols >= 72:
             active_cache = " ".join(f"{name}:{run.inventory.get(name, 0)}" for name in ABILITY_NAMES if run.inventory.get(name, 0))
             if active_cache:
@@ -1756,7 +1959,7 @@ class ViskApp:
         left = max(2, (cols - art_width) // 2)
         for i, line in enumerate(RUN_ART):
             canvas.text(left, top + i, line, fg_color=mix(theme["accent"], theme["player"], i / max(1, len(RUN_ART) - 1)), bold=True)
-        summary = "Minimalist terminal survival. Type a command, press ENTER to submit, and move by entering up/down/left/right."
+        summary = "Minimalist terminal survival. Action keys advance the run: type directly into the maze, spell up/down/left/right to turn, use BACKSPACE to rewind, and SPACE does nothing."
         for idx, line in enumerate(wrap_lines(summary, max(30, cols - 12))):
             canvas.text(6, top + 8 + idx, line, fg_color=theme["muted"])
         options = [
@@ -1886,22 +2089,33 @@ class ViskApp:
         for pickup in run.sector.pickups:
             if pickup.resolved:
                 continue
-            color = theme["enemy_alt"] if pickup.failed else theme["pickup"]
-            text = pickup.text if not pickup.failed else "." * len(pickup.text)
-            for i, ch in enumerate(text):
+            for i, ch in enumerate(pickup.text):
                 if screen := on_screen(pickup.x + i, pickup.y):
-                    canvas.put(screen[0], screen[1], ch, fg_color=color, bg_color=theme["floor"], bold=False)
+                    canvas.put(
+                        screen[0],
+                        screen[1],
+                        ch,
+                        fg_color=pickup_letter_color(theme, pickup, i),
+                        bg_color=theme["floor"],
+                        bold=False,
+                    )
 
-        for bomb in run.bombs:
-            if screen := on_screen(bomb.x, bomb.y):
-                canvas.put(screen[0], screen[1], str(max(1, bomb.fuse)), fg_color=theme["enemy"], bg_color=theme["floor"], bold=False)
         for mine in run.mines:
             if screen := on_screen(mine.x, mine.y):
                 canvas.put(screen[0], screen[1], "^", fg_color=theme["accent"], bg_color=theme["floor"], bold=False)
 
-        for enemy in run.sector.enemies:
-            if enemy.dead:
-                continue
+        for piece in run.wreckage:
+            if screen := on_screen(piece.x, piece.y):
+                canvas.put(
+                    screen[0],
+                    screen[1],
+                    piece.ch or " ",
+                    fg_color=debris_color(theme, piece.origin),
+                    bg_color=theme["floor"],
+                    bold=False,
+                )
+
+        for enemy in active_enemies_for_run(run):
             for idx, segment in enumerate(enemy.body):
                 if screen := on_screen(segment.x, segment.y):
                     canvas.put(
@@ -1914,9 +2128,7 @@ class ViskApp:
                     )
 
         blink = int(time.monotonic() * 2.6) % 2 == 0
-        for enemy in run.sector.enemies:
-            if enemy.dead:
-                continue
+        for enemy in active_enemies_for_run(run):
             head_color = enemy_head_color(theme, enemy)
             if screen := on_screen(enemy.head.x, enemy.head.y):
                 flash_fg, flash_bg = invert_colors(head_color, theme["floor"], blink)
@@ -1931,10 +2143,27 @@ class ViskApp:
 
         for idx, segment in enumerate(run.body):
             if screen := on_screen(segment.x, segment.y):
-                color = theme["player"]
-                if segment.infected > 0:
-                    color = mix(color, theme["enemy"], 0.6)
+                pickup_color = pickup_color_at_position(theme, run, (segment.x, segment.y))
+                color = player_segment_color(
+                    theme,
+                    idx,
+                    len(run.body),
+                    infected=segment.infected > 0,
+                    pickup_color=pickup_color,
+                )
                 canvas.put(screen[0], screen[1], segment.ch or " ", fg_color=color, bg_color=theme["floor"], bold=False)
+
+        for bomb in run.bombs:
+            for wx, wy, ch in bomb_display_cells(bomb):
+                if screen := on_screen(wx, wy):
+                    canvas.put(
+                        screen[0],
+                        screen[1],
+                        ch,
+                        fg_color=bomb_text_color(theme),
+                        bg_color=theme["floor"],
+                        bold=True,
+                    )
 
         if screen := on_screen(run.head.x, run.head.y):
             cursor_fg, cursor_bg = invert_colors(theme["player"], theme["floor"], blink)
@@ -1947,12 +2176,24 @@ class ViskApp:
                 bold=False,
             )
 
+        now = time.monotonic()
+        for effect in active_explosions(run, now=now):
+            for dy in range(-effect.radius, effect.radius + 1):
+                for dx in range(-effect.radius, effect.radius + 1):
+                    if abs(dx) + abs(dy) > effect.radius:
+                        continue
+                    wx = effect.x + dx
+                    wy = effect.y + dy
+                    if screen := on_screen(wx, wy):
+                        visual = explosion_visual(effect, wx, wy, run.ticks, now=now)
+                        if visual is None:
+                            continue
+                        ch, fg_color, bg_color = visual
+                        canvas.put(screen[0], screen[1], ch, fg_color=fg_color, bg_color=bg_color, bold=True)
+
         if cols >= 56:
             bytes_text = f"b{run.bytes_collected}"
             canvas.text(max(1, cols - len(bytes_text) - 2), 1, bytes_text, fg_color=theme["muted"])
-        if run.pending_command and rows >= 3:
-            command_text = f"cmd> {run.pending_command}"
-            canvas.text(2, rows - 2, command_text[: max(0, cols // 2)], fg_color=theme["player_pending"])
         if cols >= 72:
             active_cache = " ".join(f"{name}:{run.inventory.get(name, 0)}" for name in ABILITY_NAMES if run.inventory.get(name, 0))
             if active_cache:
@@ -2043,7 +2284,6 @@ class ViskApp:
         assert self.run is not None
         for char in "right":
             advance_player(self.run, char)
-        submit_command(self.run)
         use_ability(self.run, "ping")
         frame = self.render_run(120, 40).render_full()
         print("VISK smoke test ok")
