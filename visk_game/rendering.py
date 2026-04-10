@@ -4,6 +4,7 @@ import math
 import time
 
 from .constants import ABILITY_NAMES, CREDITS_PAGE_LINES, RUN_ART, SHOP_ITEMS, THEMES
+from .constants import EXIT_TEXT
 from .gameplay import active_enemies_for_run, active_explosions
 from .generation import ensure_generated_rect
 from .models import (
@@ -54,13 +55,19 @@ def pickup_letter_color(
     return theme["pickup"]
 
 
+def exit_letter_color(theme: Theme, run: RunState, index: int) -> tuple[int, int, int]:
+    if index in run.extract_matched_indices:
+        return mix(theme["bytes"], theme["player"], 0.3)
+    return theme["pickup"]
+
+
 def pickup_color_at_position(
     theme: Theme,
     run: RunState,
     position: tuple[int, int],
 ) -> tuple[int, int, int] | None:
     for pickup in run.sector.pickups:
-        if pickup.resolved:
+        if pickup.resolved or pickup.failed:
             continue
         for index, cell in enumerate(pickup.cells()):
             if cell != position:
@@ -73,6 +80,10 @@ def pickup_color_at_position(
                 return pickup_letter_color(theme, pickup, index)
             return None
     return None
+
+
+def failed_pickup_color(theme: Theme) -> tuple[int, int, int]:
+    return mix(theme["wall"], theme["muted"], 0.45)
 
 
 def player_segment_color(
@@ -290,6 +301,22 @@ class Renderer:
                         canvas.put(sx, sy, ".", fg_color=dot_color, bg_color=base)
                     else:
                         canvas.put(sx, sy, " ", bg_color=base)
+        for pickup in run.sector.pickups:
+            if pickup.resolved or not pickup.failed:
+                continue
+            for index, ch in enumerate(pickup.text):
+                wx = pickup.x + index
+                wy = pickup.y
+                sx = wx - left
+                sy = wy - top
+                if 0 <= sx < cols and 0 <= sy < rows:
+                    canvas.put(
+                        sx,
+                        sy,
+                        ch,
+                        fg_color=failed_pickup_color(theme),
+                        bg_color=theme["floor"],
+                    )
         return canvas
 
     def build_run_overlay(
@@ -340,10 +367,16 @@ class Renderer:
                     )
 
         ex, ey = run.sector.exit
-        if screen := on_screen(ex, ey):
-            pulse = 0.25 + 0.25 * (math.sin(time.monotonic() * 3.5) + 1) / 2
-            exit_color = mix(theme["pickup"], theme["accent"], pulse)
-            put(screen[0], screen[1], "x", fg_color=exit_color, bg_color=theme["floor"])
+        pulse = 0.25 + 0.25 * (math.sin(time.monotonic() * 3.5) + 1) / 2
+        for index, ch in enumerate(EXIT_TEXT):
+            if screen := on_screen(ex + index, ey):
+                put(
+                    screen[0],
+                    screen[1],
+                    ch,
+                    fg_color=mix(exit_letter_color(theme, run, index), theme["accent"], pulse),
+                    bg_color=theme["floor"],
+                )
 
         for shard in run.sector.byte_shards:
             if screen := on_screen(shard.x, shard.y):
@@ -356,7 +389,7 @@ class Renderer:
                 )
 
         for pickup in run.sector.pickups:
-            if pickup.resolved:
+            if pickup.resolved or pickup.failed:
                 continue
             for i, ch in enumerate(pickup.text):
                 if screen := on_screen(pickup.x + i, pickup.y):
@@ -367,16 +400,6 @@ class Renderer:
                         fg_color=pickup_letter_color(theme, pickup, i),
                         bg_color=theme["floor"],
                     )
-
-        for mine in run.mines:
-            if screen := on_screen(mine.x, mine.y):
-                put(
-                    screen[0],
-                    screen[1],
-                    "^",
-                    fg_color=theme["accent"],
-                    bg_color=theme["floor"],
-                )
 
         for piece in run.wreckage:
             if screen := on_screen(piece.x, piece.y):
@@ -432,6 +455,22 @@ class Renderer:
                     bg_color=theme["floor"],
                 )
 
+        for mine in run.mines:
+            if screen := on_screen(mine.x, mine.y):
+                mine_fg, mine_bg = invert_colors(
+                    mix(theme["accent"], theme["enemy"], 0.25),
+                    theme["floor"],
+                    blink,
+                )
+                put(
+                    screen[0],
+                    screen[1],
+                    "^",
+                    fg_color=mine_fg,
+                    bg_color=mine_bg,
+                    bold=True,
+                )
+
         for bomb in run.bombs:
             for wx, wy, ch in bomb_display_cells(bomb):
                 if screen := on_screen(wx, wy):
@@ -446,10 +485,11 @@ class Renderer:
 
         if screen := on_screen(run.head.x, run.head.y):
             cursor_fg, cursor_bg = invert_colors(theme["player"], theme["floor"], blink)
+            cursor_glyph = run.head.ch if run.head.ch in "^v" else arrow_for_direction(run.direction)
             put(
                 screen[0],
                 screen[1],
-                arrow_for_direction(run.direction),
+                cursor_glyph,
                 fg_color=cursor_fg,
                 bg_color=cursor_bg,
             )
@@ -469,12 +509,12 @@ class Renderer:
                     )
 
         if cols >= 56:
-            bytes_text = f"b{run.bytes_collected}"
+            bytes_text = f"bytes:{run.bytes_collected}".ljust(12)
             text(
                 max(1, cols - len(bytes_text) - 2),
                 1,
                 bytes_text,
-                fg_color=theme["muted"],
+                fg_color=theme["bytes"],
             )
         if cols >= 72:
             active_cache = " ".join(

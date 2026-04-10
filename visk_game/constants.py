@@ -6,6 +6,7 @@ SAVE_PATH = Path(__file__).resolve().parent.parent / "visk_save.json"
 CHUNK_SIZE = 28
 GENERATION_RADIUS = 2
 MAX_ENEMY_LENGTH = 200
+EXIT_TEXT = "extract"
 
 DIRECTIONS = {
     "up": (0, -1),

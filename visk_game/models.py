@@ -190,6 +190,15 @@ class Mine:
 
 
 @dataclass
+class CommandUndo:
+    step_index: int
+    previous_pending: str
+    refund_ability: str | None = None
+    bomb: Bomb | None = None
+    mine: Mine | None = None
+
+
+@dataclass
 class ExplosionParticle:
     start_dx: float
     start_dy: float
@@ -230,6 +239,12 @@ class Enemy:
 @dataclass
 class PickupAttempt:
     pickup_index: int
+    reverse: bool
+    progress: int
+
+
+@dataclass
+class ExtractAttempt:
     reverse: bool
     progress: int
 
@@ -289,6 +304,7 @@ class RunState:
     direction: str
     pending_command: str = ""
     direction_undos: list[tuple[int, str, str]] = field(default_factory=list)
+    command_undos: list[CommandUndo] = field(default_factory=list)
     bytes_collected: int = 0
     inventory: dict[str, int] = field(default_factory=dict)
     ping_path: list[tuple[int, int]] = field(default_factory=list)
@@ -301,6 +317,8 @@ class RunState:
     explosions: list[ExplosionEffect] = field(default_factory=list)
     messages: deque[str] = field(default_factory=lambda: deque(maxlen=6))
     pickup_attempt: PickupAttempt | None = None
+    extract_attempt: ExtractAttempt | None = None
+    extract_matched_indices: set[int] = field(default_factory=set)
     game_over: bool = False
     extracted: bool = False
     cause: str = ""

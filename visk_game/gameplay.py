@@ -5,10 +5,23 @@ import time
 from collections import deque
 from typing import Callable
 
-from .constants import ABILITY_NAMES, DIRECTIONS, MAX_ENEMY_LENGTH
-from .generation import bfs_world, chunk_coords, ensure_generated_around, ensure_generated_rect, generate_sector
-from .models import Bomb, Debris, Enemy, ExplosionEffect, ExplosionParticle, Mine, PickupAttempt, RunState, SaveData, Sector, Segment
+from .constants import ABILITY_NAMES, DIRECTIONS, EXIT_TEXT, MAX_ENEMY_LENGTH
+from .generation import chunk_coords, ensure_generated_around, exit_cells, generate_sector
+from .models import Bomb, CommandUndo, Debris, Enemy, ExplosionEffect, ExplosionParticle, ExtractAttempt, Mine, PickupAttempt, RunState, SaveData, Sector, Segment
 from .utils import manhattan
+
+PING_DRAW_DISTANCE = 12
+PING_DURATION_TICKS = 18
+
+
+def ping_exit_target(run: RunState) -> tuple[int, int]:
+    return run.sector.exit[0] + 3, run.sector.exit[1]
+
+
+PING_TARGETS: dict[str, tuple[str, Callable[[RunState], tuple[int, int] | None]]] = {
+    "ping_exit": ("extraction", ping_exit_target),
+}
+INLINE_ABILITY_NAMES = tuple(name for name in ABILITY_NAMES if name != "ping")
 
 
 def active_enemy_limit(run: RunState) -> int:
@@ -36,7 +49,7 @@ def add_wreckage(run: RunState, segments: list[Segment], origin: str) -> None:
 
 
 def show_run_help(run: RunState) -> None:
-    run.log("Action keys are ticks. Type direction words inline to turn, ability names inline to execute, BACKSPACE to rewind; SPACE does nothing.")
+    run.log("Action keys are ticks. Type direction words inline to turn, abilities inline to execute, ping targets like PING_EXIT to scan, BACKSPACE to rewind; SPACE does nothing.")
 
 
 def show_run_status(run: RunState) -> None:
@@ -60,6 +73,16 @@ def body_positions(body: deque[Segment]) -> set[tuple[int, int]]:
     return {(segment.x, segment.y) for segment in body}
 
 
+def add_typed_bytes(run: RunState, amount: int) -> None:
+    if amount > 0:
+        run.bytes_collected += amount
+
+
+def remove_typed_bytes(run: RunState, amount: int) -> None:
+    if amount > 0:
+        run.bytes_collected = max(0, run.bytes_collected - amount)
+
+
 def explosion_cells(x: int, y: int, radius: int) -> set[tuple[int, int]]:
     cells: set[tuple[int, int]] = set()
     for dy in range(-radius, radius + 1):
@@ -73,7 +96,7 @@ def disrupt_pickup_attempt(run: RunState, reason: str) -> None:
     if run.pickup_attempt is None:
         return
     pickup = run.sector.pickups[run.pickup_attempt.pickup_index]
-    pickup.failed = True
+    fail_pickup(run, pickup)
     run.pickup_attempt = None
     run.log(f"{pickup.text.upper()} lost on {reason}.")
 
@@ -96,7 +119,22 @@ def trim_player_history(run: RunState, retained_start: int, reason: str) -> None
         if new_step > 0:
             adjusted_undos.append((new_step, previous_direction, previous_pending[-max(0, new_step) :]))
     run.direction_undos = adjusted_undos
+    adjusted_command_undos: list[CommandUndo] = []
+    for undo in run.command_undos:
+        new_step = undo.step_index - retained_start
+        if new_step > 0:
+            adjusted_command_undos.append(
+                CommandUndo(
+                    step_index=new_step,
+                    previous_pending=undo.previous_pending[-max(0, new_step) :],
+                    refund_ability=undo.refund_ability,
+                    bomb=undo.bomb,
+                    mine=undo.mine,
+                )
+            )
+    run.command_undos = adjusted_command_undos
     disrupt_pickup_attempt(run, reason)
+    reset_extract_attempt(run)
     run.log(f"Trail cut by {reason.upper()}.")
 
 
@@ -194,6 +232,7 @@ def remove_player_segments_in_zone(run: RunState, impact_zone: set[tuple[int, in
     hit_indices = [index for index, segment in enumerate(run.body) if (segment.x, segment.y) in impact_zone]
     if not hit_indices:
         return
+    remove_typed_bytes(run, len(hit_indices))
     trim_player_history(run, hit_indices[-1] + 1, reason)
     run.wreckage = [piece for piece in run.wreckage if (piece.x, piece.y) not in impact_zone]
 
@@ -219,6 +258,7 @@ def apply_explosion(run: RunState, x: int, y: int, radius: int, owner: str) -> N
         run.sector.terrain_revision += 1
     if run.wreckage:
         run.wreckage = [piece for piece in run.wreckage if (piece.x, piece.y) not in impact_zone]
+    remove_failed_pickups_in_zone(run, impact_zone)
     remove_player_segments_in_zone(run, impact_zone, owner)
     for enemy in run.sector.enemies:
         remove_enemy_segments_in_zone(run, enemy, impact_zone, owner.upper())
@@ -264,63 +304,176 @@ def line_of_floor(sector: Sector, x: int, y: int, steps: int, direction: str, bl
     return cursor
 
 
-def use_ability(run: RunState, name: str) -> None:
+def dash_head_target(run: RunState, steps: int) -> tuple[int, int] | None:
+    dx, dy = step_from_direction(run.direction)
+    target = (run.head.x + dx * steps, run.head.y + dy * steps)
+    ensure_generated_around(run.sector, target, 1)
+    if target in run.sector.walls:
+        return None
+    if target in body_positions(run.body):
+        return None
+    if target in wreckage_positions(run):
+        return None
+    if target in enemy_positions(active_enemies_for_run(run)):
+        return None
+    return target
+
+
+def on_exit(sector: Sector, position: tuple[int, int]) -> bool:
+    return position in set(exit_cells(sector.exit))
+
+
+def exit_index(sector: Sector, position: tuple[int, int]) -> int | None:
+    for index, cell in enumerate(exit_cells(sector.exit)):
+        if cell == position:
+            return index
+    return None
+
+
+def fail_pickup(run: RunState, pickup) -> None:
+    if pickup.failed or pickup.resolved:
+        return
+    pickup.failed = True
+    pickup.matched_indices.clear()
+    pickup.error_indices.clear()
+    run.sector.terrain_revision += 1
+
+
+def remove_failed_pickups_in_zone(run: RunState, impact_zone: set[tuple[int, int]]) -> None:
+    removed_any = False
+    for pickup in run.sector.pickups:
+        if pickup.resolved or not pickup.failed:
+            continue
+        if any(cell in impact_zone for cell in pickup.cells()):
+            pickup.resolved = True
+            removed_any = True
+    if removed_any:
+        run.sector.terrain_revision += 1
+
+
+def reset_extract_attempt(run: RunState) -> None:
+    run.extract_attempt = None
+    run.extract_matched_indices.clear()
+
+
+def ping_line(start: tuple[int, int], target: tuple[int, int], max_tiles: int) -> list[tuple[int, int]]:
+    x0, y0 = start
+    x1, y1 = target
+    if start == target or max_tiles <= 0:
+        return []
+
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    cells: list[tuple[int, int]] = []
+
+    while (x, y) != (x1, y1) and len(cells) < max_tiles:
+        e2 = err * 2
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+        cells.append((x, y))
+    return cells
+
+
+def use_ping_command(run: RunState, command: str) -> bool:
+    target_spec = PING_TARGETS.get(command)
+    if target_spec is None:
+        return False
+    if run.inventory.get("ping", 0) <= 0:
+        run.log("PING unavailable.")
+        return True
+
+    label, resolver = target_spec
+    target = resolver(run)
+    if target is None:
+        run.log(f"{command.upper()} found no target.")
+        return True
+
+    run.inventory["ping"] -= 1
+    run.ping_path = ping_line((run.head.x, run.head.y), target, PING_DRAW_DISTANCE)
+    run.ping_ticks = PING_DURATION_TICKS
+    run.log(f"{command.upper()} traced {label}.")
+    return True
+
+
+def use_ability(run: RunState, name: str) -> Bomb | Mine | tuple[int, int] | None:
     if run.inventory.get(name, 0) <= 0:
         run.log(f"{name.upper()} unavailable.")
-        return
+        return None
     run.inventory[name] -= 1
     if name == "zap":
         enemy = closest_enemy(run)
         if enemy is None:
             run.log("ZAP found no target.")
             run.inventory[name] += 1
-            return
+            return None
         kill_enemy(run, enemy, "zap")
     elif name == "bomb":
         recent_segments = list(run.body)[-4:]
         bomb_cells = tuple((segment.x, segment.y) for segment in recent_segments) if len(recent_segments) == 4 else ()
         center = bomb_cells[1] if len(bomb_cells) == 4 else (run.head.x, run.head.y)
-        run.bombs.append(Bomb(center[0], center[1], fuse=6, radius=2, cells=bomb_cells))
+        bomb = Bomb(center[0], center[1], fuse=6, radius=2, cells=bomb_cells)
+        run.bombs.append(bomb)
         run.log("BOMB armed. Fuse: 5.")
+        return bomb
     elif name == "mine":
-        run.mines.append(Mine(run.head.x, run.head.y))
+        mine = Mine(run.head.x, run.head.y)
+        run.mines.append(mine)
         run.log("MINE deployed.")
+        return mine
     elif name == "silence":
         run.silence_ticks = 20
         run.log("SILENCE injected. Enemies paused for 20 ticks.")
-    elif name == "ping":
-        min_x = min(run.head.x, run.sector.exit[0]) - 18
-        max_x = max(run.head.x, run.sector.exit[0]) + 18
-        min_y = min(run.head.y, run.sector.exit[1]) - 18
-        max_y = max(run.head.y, run.sector.exit[1]) + 18
-        ensure_generated_rect(run.sector, min_x, min_y, max_x - min_x, max_y - min_y)
-        blocked = enemy_positions(active_enemies_for_run(run)) | body_positions(run.body) | wreckage_positions(run)
-        blocked.discard((run.head.x, run.head.y))
-        run.ping_path = bfs_world(
-            (run.head.x, run.head.y),
-            run.sector.exit,
-            run.sector.walls,
-            blocked,
-            bounds=(min_x, min_y, max_x, max_y),
-        )
-        run.ping_ticks = 18
-        run.log("PING resolved route to extraction.")
     elif name == "dash":
-        blockers = body_positions(run.body) | enemy_positions(active_enemies_for_run(run)) | wreckage_positions(run)
-        blockers.discard((run.head.x, run.head.y))
-        target = line_of_floor(run.sector, run.head.x, run.head.y, 4, run.direction, blockers)
-        if target == (run.head.x, run.head.y):
+        target = dash_head_target(run, 4)
+        if target is None:
             run.log("DASH obstructed.")
             run.inventory[name] += 1
-            return
-        run.head.x = target[0]
-        run.head.y = target[1]
-        maybe_collect_byte(run, (target[0], target[1]))
-        if target == run.sector.exit:
-            run.extracted = True
-            run.game_over = True
-            run.cause = "extracted"
+            return None
         run.log("DASH executed.")
+        return target
+    return None
+
+
+def append_command_undo(
+    run: RunState,
+    *,
+    step_index: int,
+    previous_pending: str,
+    refund_ability: str | None = None,
+    bomb: Bomb | None = None,
+    mine: Mine | None = None,
+) -> None:
+    run.command_undos.append(
+        CommandUndo(
+            step_index=step_index,
+            previous_pending=previous_pending,
+            refund_ability=refund_ability,
+            bomb=bomb,
+            mine=mine,
+        )
+    )
+
+
+def undo_command_effect(run: RunState, undo: CommandUndo) -> None:
+    refunded = False
+    if undo.refund_ability == "bomb" and undo.bomb in run.bombs:
+        run.bombs.remove(undo.bomb)
+        run.inventory["bomb"] = run.inventory.get("bomb", 0) + 1
+        refunded = True
+    elif undo.refund_ability == "mine" and undo.mine in run.mines:
+        run.mines.remove(undo.mine)
+        run.inventory["mine"] = run.inventory.get("mine", 0) + 1
+        refunded = True
+    if refunded:
+        run.log(f"{undo.refund_ability.upper()} rewound.")
 
 
 def maybe_collect_byte(run: RunState, position: tuple[int, int] | None = None) -> None:
@@ -331,6 +484,56 @@ def maybe_collect_byte(run: RunState, position: tuple[int, int] | None = None) -
             run.sector.byte_shards.remove(shard)
             run.log(f"Byte shard extracted. +{shard.value}.")
             return
+
+
+def begin_or_update_extract(run: RunState, typed_char: str, position: tuple[int, int]) -> bool:
+    current_index = exit_index(run.sector, position)
+    if run.extract_attempt is not None:
+        expected_index = (
+            len(EXIT_TEXT) - 1 - run.extract_attempt.progress
+            if run.extract_attempt.reverse
+            else run.extract_attempt.progress
+        )
+        if current_index != expected_index:
+            reset_extract_attempt(run)
+            if current_index is None:
+                return False
+    if current_index is None:
+        return False
+
+    reverse = run.direction == "left"
+    if run.extract_attempt is None:
+        valid_start = (not reverse and current_index == 0) or (reverse and current_index == len(EXIT_TEXT) - 1)
+        if not valid_start:
+            reset_extract_attempt(run)
+            return True
+        expected = EXIT_TEXT[current_index]
+        if typed_char.lower() != expected:
+            reset_extract_attempt(run)
+            run.log("EXTRACT rejected.")
+            return True
+        run.extract_matched_indices.add(current_index)
+        run.extract_attempt = ExtractAttempt(reverse=reverse, progress=1)
+        if len(EXIT_TEXT) == 1:
+            run.extracted = True
+            run.game_over = True
+            run.cause = "extracted"
+        return True
+
+    expected = EXIT_TEXT[current_index]
+    if typed_char.lower() != expected:
+        reset_extract_attempt(run)
+        run.log("EXTRACT rejected.")
+        return True
+    run.extract_matched_indices.add(current_index)
+    run.extract_attempt.progress += 1
+    if run.extract_attempt.progress >= len(EXIT_TEXT):
+        run.extracted = True
+        run.game_over = True
+        run.cause = "extracted"
+        run.log("EXTRACT accepted.")
+        return True
+    return True
 
 
 def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, int] | None = None) -> bool:
@@ -356,9 +559,7 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
             else run.pickup_attempt.progress
         )
         if current_pickup_index != run.pickup_attempt.pickup_index or current_index != expected_index:
-            pickup.failed = True
-            if current_pickup_index == run.pickup_attempt.pickup_index and current_index is not None:
-                pickup.error_indices.add(current_index)
+            fail_pickup(run, pickup)
             run.log(f"{pickup.text.upper()} lost in transit.")
             run.pickup_attempt = None
             return True
@@ -371,14 +572,12 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
     if run.pickup_attempt is None:
         valid_start = (not reverse and current_index == 0) or (reverse and current_index == len(pickup.text) - 1)
         if not valid_start:
-            pickup.failed = True
-            pickup.error_indices.add(current_index)
+            fail_pickup(run, pickup)
             run.log(f"{pickup.text.upper()} corrupted.")
             return True
         expected = pickup.text[current_index]
         if typed_char.lower() != expected:
-            pickup.failed = True
-            pickup.error_indices.add(current_index)
+            fail_pickup(run, pickup)
             run.log(f"{pickup.text.upper()} mistyped and purged.")
             return True
         pickup.matched_indices.add(current_index)
@@ -392,8 +591,7 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
 
     expected = pickup.text[current_index]
     if typed_char.lower() != expected:
-        pickup.failed = True
-        pickup.error_indices.add(current_index)
+        fail_pickup(run, pickup)
         run.pickup_attempt = None
         run.log(f"{pickup.text.upper()} mistyped and purged.")
         return True
@@ -407,25 +605,56 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
     return True
 
 
-def resolve_inline_command(run: RunState) -> None:
+def resolve_inline_command(run: RunState) -> tuple[int, int] | None:
     if not run.pending_command:
-        return
+        return None
     suffix = run.pending_command.lower()
-    commands = sorted(("status", "help", *ABILITY_NAMES, *DIRECTIONS.keys()), key=len, reverse=True)
+    commands = sorted(("status", "help", *PING_TARGETS.keys(), *INLINE_ABILITY_NAMES, *DIRECTIONS.keys()), key=len, reverse=True)
     for command in commands:
         if not suffix.endswith(command):
             continue
+        previous_pending = run.pending_command[:-1]
+        step_index = len(run.body)
+        movement_override: tuple[int, int] | None = None
         if command in DIRECTIONS:
-            run.direction_undos.append((len(run.body), run.direction, run.pending_command[:-1]))
+            run.direction_undos.append((step_index, run.direction, previous_pending))
             run.direction = command
+        elif command in PING_TARGETS:
+            use_ping_command(run, command)
+            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
         elif command in ABILITY_NAMES:
-            use_ability(run, command)
+            effect = use_ability(run, command)
+            if command == "bomb":
+                append_command_undo(
+                    run,
+                    step_index=step_index,
+                    previous_pending=previous_pending,
+                    refund_ability="bomb" if isinstance(effect, Bomb) else None,
+                    bomb=effect if isinstance(effect, Bomb) else None,
+                )
+            elif command == "mine":
+                append_command_undo(
+                    run,
+                    step_index=step_index,
+                    previous_pending=previous_pending,
+                    refund_ability="mine" if isinstance(effect, Mine) else None,
+                    mine=effect if isinstance(effect, Mine) else None,
+                )
+            elif command == "dash":
+                append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
+                if isinstance(effect, tuple):
+                    movement_override = effect
+            else:
+                append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
         elif command == "help":
             show_run_help(run)
+            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
         else:
             show_run_status(run)
+            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
         run.pending_command = ""
-        return
+        return movement_override
+    return None
 
 
 def advance_player(run: RunState, typed_char: str) -> None:
@@ -439,52 +668,91 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
     ny = current_head.y + dy
     next_pos = (nx, ny)
     ensure_generated_around(run.sector, next_pos, 1)
-    if next_pos in run.sector.walls:
-        run.game_over = True
-        run.cause = "wall collision"
-        return
-    if next_pos in {(segment.x, segment.y) for segment in list(run.body)[:-1]}:
-        run.game_over = True
-        run.cause = "self collision"
-        return
-    if next_pos in wreckage_positions(run):
-        run.game_over = True
-        run.cause = "wreckage collision"
-        return
-    if next_pos in enemy_positions(active_enemies_for_run(run)):
-        run.game_over = True
-        run.cause = "enemy collision"
-        return
+
+    def collision_cause(position: tuple[int, int]) -> str | None:
+        if position in run.sector.walls:
+            return "wall collision"
+        if position in {(segment.x, segment.y) for segment in list(run.body)[:-1]}:
+            return "self collision"
+        if position in wreckage_positions(run):
+            return "wreckage collision"
+        if position in enemy_positions(active_enemies_for_run(run)):
+            return "enemy collision"
+        return None
+
+    dash_candidate = record_command and (run.pending_command + typed_char).lower().endswith("dash")
+    if not dash_candidate:
+        cause = collision_cause(next_pos)
+        if cause is not None:
+            run.game_over = True
+            run.cause = cause
+            return
+
     current_position = (current_head.x, current_head.y)
-    current_head.ch = typed_char
-    maybe_collect_byte(run, current_position)
+    movement_target = next_pos
+    dash_jump_start: tuple[int, int] | None = None
+    dash_v_position: tuple[int, int] | None = None
     if record_command:
         run.pending_command += typed_char
-        pickup_touched = begin_or_update_pickup(run, typed_char, current_position)
-        if not pickup_touched:
-            resolve_inline_command(run)
-    run.body.append(Segment(nx, ny, " "))
-    if next_pos == run.sector.exit:
-        run.extracted = True
+        extract_touched = begin_or_update_extract(run, typed_char, current_position)
+        if run.game_over:
+            return
+        pickup_touched = False if extract_touched else begin_or_update_pickup(run, typed_char, current_position)
+        if not extract_touched and not pickup_touched:
+            dash_target = resolve_inline_command(run)
+            if dash_target is not None:
+                movement_target = dash_target
+                dash_jump_start = next_pos
+                dash_v_position = (movement_target[0] - dx, movement_target[1] - dy)
+
+    cause = collision_cause(movement_target)
+    if cause is not None:
         run.game_over = True
-        run.cause = "extracted"
+        run.cause = cause
+        return
+
+    current_head.ch = typed_char
+    add_typed_bytes(run, 1)
+    maybe_collect_byte(run, current_position)
+    if dash_jump_start is not None:
+        run.body.append(Segment(dash_jump_start[0], dash_jump_start[1], "^"))
+        if dash_v_position != dash_jump_start:
+            run.body.append(Segment(dash_v_position[0], dash_v_position[1], "v"))
+        run.body.append(Segment(movement_target[0], movement_target[1], " "))
+        maybe_collect_byte(run, movement_target)
+    else:
+        run.body.append(Segment(movement_target[0], movement_target[1], " "))
 
 
 def retract_player(run: RunState) -> None:
     if len(run.body) <= 1:
         return
+    if manhattan((run.body[-1].x, run.body[-1].y), (run.body[-2].x, run.body[-2].y)) > 1:
+        return
     current_step = len(run.body) - 1
     if run.pending_command:
         run.pending_command = run.pending_command[:-1]
+    elif run.command_undos and run.command_undos[-1].step_index == current_step:
+        undo = run.command_undos.pop()
+        undo_command_effect(run, undo)
+        run.pending_command = undo.previous_pending
     elif run.direction_undos and run.direction_undos[-1][0] == current_step:
         _, previous_direction, previous_pending = run.direction_undos.pop()
         run.direction = previous_direction
         run.pending_command = previous_pending
+    elif run.body[-1].ch == " " and run.body[-2].ch == "v":
+        run.body.pop()
+        run.body[-1].ch = " "
+        disrupt_pickup_attempt(run, "rollback")
+        reset_extract_attempt(run)
+        return
     else:
         return
+    remove_typed_bytes(run, 1)
     run.body.pop()
     run.body[-1].ch = " "
     disrupt_pickup_attempt(run, "rollback")
+    reset_extract_attempt(run)
 
 
 def resolve_enemy_step(

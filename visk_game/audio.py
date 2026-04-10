@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+import pygame
 
 
 class AudioManager:
     def __init__(self) -> None:
         self.enabled = False
         self.current_track: str | None = None
-        self._pygame: Any = None
         self._rng = random.Random()
         self._keystroke_sounds: list[Any] = []
         self._keystroke_loaded = False
@@ -21,27 +25,23 @@ class AudioManager:
             "run": self._res_dir / "Echoes of Eternity.ogg",
         }
         self._keystroke_config_path = self._res_dir / "config.json"
+        self._ensure_ready()
 
     def _ensure_ready(self) -> bool:
         if self.enabled:
             return True
-        try:
-            import pygame
-        except Exception:
-            return False
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
             pygame.mixer.set_num_channels(max(16, pygame.mixer.get_num_channels()))
         except Exception:
             return False
-        self._pygame = pygame
         self.enabled = True
         self._load_keystroke_sounds()
         return True
 
     def _load_keystroke_sounds(self) -> None:
-        if self._keystroke_loaded or self._pygame is None:
+        if self._keystroke_loaded or pygame is None:
             return
         self._keystroke_loaded = True
         if not self._keystroke_config_path.exists():
@@ -53,9 +53,9 @@ class AudioManager:
             defines = config.get("defines", {})
             if not sound_path.exists() or not isinstance(defines, dict):
                 return
-            base_sound = self._pygame.mixer.Sound(str(sound_path))
-            samples = self._pygame.sndarray.array(base_sound)
-            mixer_init = self._pygame.mixer.get_init()
+            base_sound = pygame.mixer.Sound(str(sound_path))
+            samples = pygame.sndarray.array(base_sound)
+            mixer_init = pygame.mixer.get_init()
             if mixer_init is None:
                 return
             sample_rate = mixer_init[0]
@@ -64,7 +64,9 @@ class AudioManager:
                 if not isinstance(define, list) or len(define) != 2:
                     continue
                 start_ms, duration_ms = define
-                if not isinstance(start_ms, int | float) or not isinstance(duration_ms, int | float):
+                if not isinstance(start_ms, int | float) or not isinstance(
+                    duration_ms, int | float
+                ):
                     continue
                 if duration_ms <= 0:
                     continue
@@ -74,18 +76,18 @@ class AudioManager:
                 if end_frame <= start_frame:
                     continue
                 clip = samples[start_frame:end_frame].copy()
-                sound = self._pygame.sndarray.make_sound(clip)
+                sound = pygame.sndarray.make_sound(clip)
                 sound.set_volume(0.45)
                 self._keystroke_sounds.append(sound)
         except Exception:
             self._keystroke_sounds.clear()
 
     def stop_music(self) -> None:
-        if not self.enabled or self._pygame is None:
+        if not self.enabled or pygame is None:
             self.current_track = None
             return
         try:
-            self._pygame.mixer.music.stop()
+            pygame.mixer.music.stop()
         except Exception:
             pass
         self.current_track = None
@@ -102,10 +104,10 @@ class AudioManager:
         path = self._music_paths[target]
         if not path.exists():
             return
-        assert self._pygame is not None
+        assert pygame is not None
         try:
-            self._pygame.mixer.music.load(str(path))
-            self._pygame.mixer.music.play(-1)
+            pygame.mixer.music.load(str(path))
+            pygame.mixer.music.play(-1)
         except Exception:
             return
         self.current_track = target
@@ -119,7 +121,10 @@ class AudioManager:
             index = 0
         else:
             index = self._rng.randrange(len(self._keystroke_sounds) - 1)
-            if self._last_keystroke_index is not None and index >= self._last_keystroke_index:
+            if (
+                self._last_keystroke_index is not None
+                and index >= self._last_keystroke_index
+            ):
                 index += 1
         self._last_keystroke_index = index
         try:
@@ -128,11 +133,11 @@ class AudioManager:
             return
 
     def shutdown(self) -> None:
-        if not self.enabled or self._pygame is None:
+        if not self.enabled or pygame is None:
             return
         try:
-            self._pygame.mixer.music.stop()
-            self._pygame.mixer.quit()
+            pygame.mixer.music.stop()
+            pygame.mixer.quit()
         except Exception:
             pass
         self.enabled = False

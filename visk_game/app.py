@@ -248,13 +248,3 @@ class ViskApp:
                             self.finish_run()
         finally:
             self.audio.shutdown()
-
-    def smoke_test(self) -> None:
-        self.new_run()
-        assert self.run is not None
-        for char in "right":
-            advance_player(self.run, char)
-        use_ability(self.run, "ping")
-        frame = self.renderer.render_run(self.run, 120, 40).render_full()
-        print("VISK smoke test ok")
-        print(frame[:400].replace("\x1b", "<ESC>"))

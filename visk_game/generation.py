@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from collections import deque
 
-from .constants import ABILITY_NAMES, CHUNK_SIZE, DIRECTIONS, GENERATION_RADIUS, SECTOR_NAMES, THEMES
+from .constants import ABILITY_NAMES, CHUNK_SIZE, DIRECTIONS, EXIT_TEXT, GENERATION_RADIUS, SECTOR_NAMES, THEMES
 from .models import ByteShard, Enemy, Pickup, SaveData, Sector, Segment
 from .utils import hash_noise, manhattan, random_word
 
@@ -121,15 +121,25 @@ def reserve_radius(center: tuple[int, int], point: tuple[int, int], radius: int)
     return manhattan(center, point) <= radius
 
 
+def exit_cells(exit_pos: tuple[int, int]) -> list[tuple[int, int]]:
+    return [(exit_pos[0] + offset, exit_pos[1]) for offset in range(len(EXIT_TEXT))]
+
+
+def exit_center(exit_pos: tuple[int, int]) -> tuple[int, int]:
+    return exit_pos[0] + len(EXIT_TEXT) // 2, exit_pos[1]
+
+
 def is_reserved_world(sector: Sector, point: tuple[int, int]) -> bool:
-    return reserve_radius(sector.start, point, 5) or reserve_radius(sector.exit, point, 6)
+    return reserve_radius(sector.start, point, 5) or any(
+        reserve_radius(cell, point, 2) for cell in exit_cells(sector.exit)
+    )
 
 
 def sector_occupied_cells(sector: Sector) -> set[tuple[int, int]]:
     occupied = set(sector.walls)
-    occupied.add(sector.exit)
+    occupied.update(exit_cells(sector.exit))
     for pickup in sector.pickups:
-        if pickup.resolved:
+        if pickup.resolved or pickup.failed:
             continue
         occupied.update(pickup.cells())
     for shard in sector.byte_shards:
@@ -169,7 +179,7 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
     occupied = sector_occupied_cells(sector)
     base_x, base_y = chunk_origin(cx, cy, sector.chunk_size)
     near_start = manhattan((base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2), sector.start) <= sector.chunk_size * 2
-    near_exit = manhattan((base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2), sector.exit) <= sector.chunk_size * 2
+    near_exit = manhattan((base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2), exit_center(sector.exit)) <= sector.chunk_size * 2
 
     shape_count = rng.randint(0, 2) if near_start else rng.randint(1, 4)
     for _ in range(shape_count):
