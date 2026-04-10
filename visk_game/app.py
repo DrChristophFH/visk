@@ -9,20 +9,64 @@ from .constants import DIRECTIONS, SHOP_ITEMS
 from .gameplay import advance_player, create_run, retract_player, tick
 from .models import CreditsState, RunState, Segment
 from .rendering import Renderer
+from .scene_types import GameSession
+from .scenes import CreditsScene, MenuScene, ResultScene, RunScene, ShopScene
 from .storage import load_save, save_save
 from .terminal import TerminalController
 
 
 class ViskApp:
     def __init__(self) -> None:
-        self.save = load_save()
+        self.session = GameSession(save=load_save())
         self.rng = random.Random()
-        self.state = "menu"
-        self.run: RunState | None = None
-        self.credits: CreditsState | None = None
-        self.shop_cursor = 0
         self.renderer = Renderer()
         self.audio = AudioManager()
+        self.scenes = {
+            "menu": MenuScene(self.renderer, self.session),
+            "shop": ShopScene(self.renderer, self.session),
+            "credits": CreditsScene(self.renderer, self.session),
+            "result": ResultScene(self.renderer, self.session),
+            "run": RunScene(self.renderer, self.session),
+        }
+
+    @property
+    def save(self):
+        return self.session.save
+
+    @property
+    def state(self) -> str:
+        return self.session.state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self.session.state = value
+
+    @property
+    def run(self) -> RunState | None:
+        return self.session.run
+
+    @run.setter
+    def run(self, value: RunState | None) -> None:
+        self.session.run = value
+
+    @property
+    def credits(self) -> CreditsState | None:
+        return self.session.credits
+
+    @credits.setter
+    def credits(self, value: CreditsState | None) -> None:
+        self.session.credits = value
+
+    @property
+    def shop_cursor(self) -> int:
+        return self.session.shop_cursor
+
+    @shop_cursor.setter
+    def shop_cursor(self, value: int) -> None:
+        self.session.shop_cursor = value
+
+    def current_scene(self):
+        return self.scenes.get(self.state, self.scenes["menu"])
 
     def new_run(self) -> None:
         self.run = create_run(self.save)
@@ -197,13 +241,7 @@ class ViskApp:
             with TerminalController() as terminal:
                 while True:
                     self.audio.sync_music(self.state, self.save.audio_enabled)
-                    frame = self.renderer.render_frame(
-                        self.state,
-                        self.run,
-                        self.credits,
-                        self.save,
-                        self.shop_cursor,
-                    )
+                    frame = self.renderer.present_scene(self.current_scene())
                     if frame:
                         sys.stdout.write(frame)
                         sys.stdout.flush()

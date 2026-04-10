@@ -18,12 +18,30 @@ class Cell:
     bg: Color | None = None
     bold: bool = False
 
+    def is_transparent(self) -> bool:
+        return self.ch == " " and self.fg is None and self.bg is None and not self.bold
+
 
 class Canvas:
-    def __init__(self, width: int, height: int, background: Color) -> None:
+    def __init__(self, width: int, height: int, background: Color | None) -> None:
         self.width = width
         self.height = height
-        self.cells = [[Cell(" ", None, background, False) for _ in range(width)] for _ in range(height)]
+        self.cells = [
+            [Cell(" ", None, background, False) for _ in range(width)]
+            for _ in range(height)
+        ]
+
+    @classmethod
+    def transparent(cls, width: int, height: int) -> "Canvas":
+        return cls(width, height, None)
+
+    def copy(self) -> "Canvas":
+        clone = Canvas.transparent(self.width, self.height)
+        clone.cells = [
+            [Cell(cell.ch, cell.fg, cell.bg, cell.bold) for cell in row]
+            for row in self.cells
+        ]
+        return clone
 
     def put(
         self,
