@@ -6,7 +6,7 @@ import time
 from ..constants import ABILITY_NAMES, EXIT_TEXT, THEMES
 from ..gameplay import active_enemies_for_run, active_explosions
 from ..generation import ensure_generated_rect
-from ..models import Bomb, Canvas, Debris, Enemy, ExplosionEffect, Pickup, RunState, Theme
+from ..models import Canvas, Debris, Enemy, ExplosionEffect, Pickup, RunState, Theme
 from ..scene_types import SceneLayer, SceneRenderResult
 from ..utils import arrow_for_direction, clamp, hash_noise, invert_colors, mix
 from .base import BaseScene
@@ -60,18 +60,6 @@ def pickup_color_at_position(
 
 def failed_pickup_color(theme: Theme) -> tuple[int, int, int]:
     return mix(theme["wall"], theme["muted"], 0.45)
-
-
-def bomb_display_cells(bomb: Bomb) -> list[tuple[int, int, str]]:
-    countdown = str(max(0, bomb.fuse))
-    if len(bomb.cells) == 4:
-        glyphs = ("b", countdown, "m", "b")
-        return [(cell[0], cell[1], glyph) for cell, glyph in zip(bomb.cells, glyphs)]
-    return [(bomb.x, bomb.y, countdown)]
-
-
-def bomb_text_color(theme: Theme) -> tuple[int, int, int]:
-    return mix(theme["enemy"], (255, 150, 150), 0.25)
 
 
 EXPLOSION_BLOCKS = ("\u2591", "\u2592", "\u2593", "\u2588")
@@ -342,10 +330,8 @@ class RunScene(BaseScene):
             for idx, ch in enumerate(value):
                 put(x + idx, y, ch, fg_color=fg_color, bg_color=bg_color, bold=bold)
 
-        if run.ping_ticks > 0:
-            for wx, wy in run.ping_path:
-                if screen := on_screen(wx, wy):
-                    put(screen[0], screen[1], "·", fg_color=theme["ping"])
+        for ping in run.pings:
+            ping.render(on_screen, put, theme)
 
         ex, ey = run.sector.exit
         pulse = 0.25 + 0.25 * (math.sin(time.monotonic() * 3.5) + 1) / 2
@@ -398,18 +384,16 @@ class RunScene(BaseScene):
                 put(screen[0], screen[1], segment.ch or " ", fg_color=color)
 
         for mine in run.mines:
-            if screen := on_screen(mine.x, mine.y):
-                mine_fg, mine_bg = invert_colors(
-                    mix(theme["accent"], theme["enemy"], 0.25),
-                    theme["floor"],
-                    blink,
-                )
-                put(screen[0], screen[1], "^", fg_color=mine_fg, bg_color=mine_bg, bold=True)
+            mine.render(
+                on_screen,
+                put,
+                theme,
+                blink=blink,
+                invert_colors=invert_colors,
+            )
 
         for bomb in run.bombs:
-            for wx, wy, ch in bomb_display_cells(bomb):
-                if screen := on_screen(wx, wy):
-                    put(screen[0], screen[1], ch, fg_color=bomb_text_color(theme), bold=True)
+            bomb.render(on_screen, put, theme)
 
         if screen := on_screen(run.head.x, run.head.y):
             cursor_fg, cursor_bg = invert_colors(theme["player"], theme["floor"], blink)

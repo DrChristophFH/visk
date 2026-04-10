@@ -192,6 +192,7 @@ class ByteShard:
 
 @dataclass
 class Bomb:
+    object_id: str
     x: int
     y: int
     fuse: int
@@ -199,21 +200,74 @@ class Bomb:
     owner: str = "player"
     cells: tuple[tuple[int, int], ...] = ()
 
+    def display_cells(self) -> list[tuple[int, int, str]]:
+        countdown = str(max(0, self.fuse))
+        if len(self.cells) == 4:
+            glyphs = ("b", countdown, "m", "b")
+            return [(cell[0], cell[1], glyph) for cell, glyph in zip(self.cells, glyphs)]
+        return [(self.x, self.y, countdown)]
+
+    def advance(self, *, advance_fuse: bool) -> bool:
+        if advance_fuse:
+            self.fuse -= 1
+        return self.fuse < 0
+
+    def render(self, on_screen, put, theme) -> None:
+        tone = mix(theme["enemy"], (255, 150, 150), 0.25)
+        for wx, wy, ch in self.display_cells():
+            if screen := on_screen(wx, wy):
+                put(screen[0], screen[1], ch, fg_color=tone, bold=True)
+
 
 @dataclass
 class Mine:
+    object_id: str
     x: int
     y: int
     radius: int = 1
+
+    def triggered_by(self, enemy_positions: set[tuple[int, int]], manhattan) -> bool:
+        return any(manhattan((self.x, self.y), position) <= self.radius for position in enemy_positions)
+
+    def render(self, on_screen, put, theme, *, blink: bool, invert_colors) -> None:
+        if screen := on_screen(self.x, self.y):
+            mine_fg, mine_bg = invert_colors(
+                mix(theme["accent"], theme["enemy"], 0.25),
+                theme["floor"],
+                blink,
+            )
+            put(screen[0], screen[1], "^", fg_color=mine_fg, bg_color=mine_bg, bold=True)
+
+
+@dataclass
+class PingTrace:
+    object_id: str
+    path: list[tuple[int, int]]
+    ticks_remaining: int
+
+    def advance(self) -> bool:
+        self.ticks_remaining -= 1
+        return self.ticks_remaining <= 0
+
+    def render(self, on_screen, put, theme) -> None:
+        for wx, wy in self.path:
+            if screen := on_screen(wx, wy):
+                put(screen[0], screen[1], "·", fg_color=theme["ping"])
+
+
+@dataclass
+class UndoAction:
+    kind: str
+    object_id: str | None = None
+    inventory_name: str | None = None
+    label: str | None = None
 
 
 @dataclass
 class CommandUndo:
     step_index: int
     previous_pending: str
-    refund_ability: str | None = None
-    bomb: Bomb | None = None
-    mine: Mine | None = None
+    undo_action: UndoAction | None = None
 
 
 @dataclass
@@ -325,8 +379,7 @@ class RunState:
     command_undos: list[CommandUndo] = field(default_factory=list)
     bytes_collected: int = 0
     inventory: dict[str, int] = field(default_factory=dict)
-    ping_path: list[tuple[int, int]] = field(default_factory=list)
-    ping_ticks: int = 0
+    pings: list[PingTrace] = field(default_factory=list)
     blind_ticks: int = 0
     silence_ticks: int = 0
     bombs: list[Bomb] = field(default_factory=list)
@@ -345,6 +398,7 @@ class RunState:
     hardcore: bool = False
     camera_left: int | None = None
     camera_top: int | None = None
+    next_object_id: int = 0
 
     @property
     def head(self) -> Segment:

@@ -5,23 +5,11 @@ import time
 from collections import deque
 from typing import Callable
 
+from .abilities import ABILITY_COMMANDS, AbilityContext, get_ability
 from .constants import ABILITY_NAMES, DIRECTIONS, EXIT_TEXT, MAX_ENEMY_LENGTH
 from .generation import chunk_coords, ensure_generated_around, exit_cells, generate_sector
-from .models import Bomb, CommandUndo, Debris, Enemy, ExplosionEffect, ExplosionParticle, ExtractAttempt, Mine, PickupAttempt, RunState, SaveData, Sector, Segment
+from .models import Bomb, CommandUndo, Debris, Enemy, ExplosionEffect, ExplosionParticle, ExtractAttempt, Mine, PickupAttempt, PingTrace, RunState, SaveData, Sector, Segment, UndoAction
 from .utils import manhattan
-
-PING_DRAW_DISTANCE = 12
-PING_DURATION_TICKS = 18
-
-
-def ping_exit_target(run: RunState) -> tuple[int, int]:
-    return run.sector.exit[0] + 3, run.sector.exit[1]
-
-
-PING_TARGETS: dict[str, tuple[str, Callable[[RunState], tuple[int, int] | None]]] = {
-    "ping_exit": ("extraction", ping_exit_target),
-}
-INLINE_ABILITY_NAMES = tuple(name for name in ABILITY_NAMES if name != "ping")
 
 
 def active_enemy_limit(run: RunState) -> int:
@@ -71,6 +59,189 @@ def create_run(save: SaveData) -> RunState:
 
 def body_positions(body: deque[Segment]) -> set[tuple[int, int]]:
     return {(segment.x, segment.y) for segment in body}
+
+
+class PlayerController:
+    def __init__(
+        self,
+        run: RunState,
+        *,
+        typed_char: str,
+        current_position: tuple[int, int],
+        next_position: tuple[int, int],
+        step_index: int,
+    ) -> None:
+        self.run = run
+        self.typed_char = typed_char
+        self.current_position = current_position
+        self.next_position = next_position
+        self.step_index = step_index
+        self.movement_target = next_position
+        self.dash_jump_start: tuple[int, int] | None = None
+        self.dash_v_position: tuple[int, int] | None = None
+        self._undo_action: UndoAction | None = None
+
+    def head_position(self) -> tuple[int, int]:
+        return self.current_position
+
+    def direction(self) -> str:
+        return self.run.direction
+
+    def inventory_available(self, name: str) -> bool:
+        return self.run.inventory.get(name, 0) > 0
+
+    def consume_inventory(self, name: str) -> bool:
+        if not self.inventory_available(name):
+            return False
+        self.run.inventory[name] -= 1
+        return True
+
+    def refund_inventory(self, name: str) -> None:
+        self.run.inventory[name] = self.run.inventory.get(name, 0) + 1
+
+    def queue_dash(self, target: tuple[int, int]) -> None:
+        dx = target[0] - self.next_position[0]
+        dy = target[1] - self.next_position[1]
+        self.movement_target = target
+        self.dash_jump_start = self.next_position
+        self.dash_v_position = (target[0] - max(-1, min(1, dx)), target[1] - max(-1, min(1, dy)))
+
+    def attach_undo_action(self, action: UndoAction) -> None:
+        self._undo_action = action
+
+    def commit_command(self, previous_pending: str) -> None:
+        append_command_undo(
+            self.run,
+            step_index=self.step_index,
+            previous_pending=previous_pending,
+            undo_action=self._undo_action,
+        )
+        self._undo_action = None
+
+    def log(self, message: str) -> None:
+        self.run.log(message)
+
+
+class WorldController:
+    def __init__(self, run: RunState) -> None:
+        self.run = run
+
+    def closest_enemy(self) -> Enemy | None:
+        living = active_enemies_for_run(self.run)
+        if not living:
+            return None
+        return min(
+            living,
+            key=lambda enemy: manhattan(
+                (enemy.head.x, enemy.head.y), (self.run.head.x, self.run.head.y)
+            ),
+        )
+
+    def kill_enemy(self, enemy: Enemy, reason: str) -> None:
+        kill_enemy(self.run, enemy, reason)
+
+    def next_object_id(self, prefix: str) -> str:
+        self.run.next_object_id += 1
+        return f"{prefix}:{self.run.next_object_id}"
+
+    def remove_object(self, object_id: str) -> bool:
+        for attr in ("bombs", "mines", "pings"):
+            collection = getattr(self.run, attr)
+            for item in list(collection):
+                if item.object_id == object_id:
+                    collection.remove(item)
+                    return True
+        return False
+
+    def spawn_bomb_from_player(self, player: PlayerController) -> str:
+        recent_segments = list(self.run.body)[-4:]
+        bomb_cells = (
+            tuple((segment.x, segment.y) for segment in recent_segments)
+            if len(recent_segments) == 4
+            else ()
+        )
+        center = (
+            bomb_cells[1]
+            if len(bomb_cells) == 4
+            else player.head_position()
+        )
+        bomb = Bomb(
+            object_id=self.next_object_id("bomb"),
+            x=center[0],
+            y=center[1],
+            fuse=6,
+            radius=2,
+            cells=bomb_cells,
+        )
+        self.run.bombs.append(bomb)
+        return bomb.object_id
+
+    def spawn_mine_at_player(self, player: PlayerController) -> str:
+        mine = Mine(
+            object_id=self.next_object_id("mine"),
+            x=player.head_position()[0],
+            y=player.head_position()[1],
+        )
+        self.run.mines.append(mine)
+        return mine.object_id
+
+    def ping_exit_target(self) -> tuple[int, int] | None:
+        return self.run.sector.exit[0] + 3, self.run.sector.exit[1]
+
+    def trace_line(
+        self, start: tuple[int, int], target: tuple[int, int], max_tiles: int
+    ) -> list[tuple[int, int]]:
+        x0, y0 = start
+        x1, y1 = target
+        if start == target or max_tiles <= 0:
+            return []
+
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        cells: list[tuple[int, int]] = []
+
+        while (x, y) != (x1, y1) and len(cells) < max_tiles:
+            e2 = err * 2
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+            cells.append((x, y))
+        return cells
+
+    def spawn_ping_trace(self, path: list[tuple[int, int]], duration: int) -> str:
+        ping = PingTrace(
+            object_id=self.next_object_id("ping"),
+            path=path,
+            ticks_remaining=duration,
+        )
+        self.run.pings.append(ping)
+        return ping.object_id
+
+    def set_silence_ticks(self, ticks: int) -> None:
+        self.run.silence_ticks = max(self.run.silence_ticks, ticks)
+
+    def find_dash_target(
+        self, direction: str, steps: int
+    ) -> tuple[int, int] | None:
+        dx, dy = step_from_direction(direction)
+        target = (self.run.head.x + dx * steps, self.run.head.y + dy * steps)
+        ensure_generated_around(self.run.sector, target, 1)
+        if target in self.run.sector.walls:
+            return None
+        if target in body_positions(self.run.body):
+            return None
+        if target in wreckage_positions(self.run):
+            return None
+        if target in enemy_positions(active_enemies_for_run(self.run)):
+            return None
+        return target
 
 
 def add_typed_bytes(run: RunState, amount: int) -> None:
@@ -127,9 +298,7 @@ def trim_player_history(run: RunState, retained_start: int, reason: str) -> None
                 CommandUndo(
                     step_index=new_step,
                     previous_pending=undo.previous_pending[-max(0, new_step) :],
-                    refund_ability=undo.refund_ability,
-                    bomb=undo.bomb,
-                    mine=undo.mine,
+                    undo_action=undo.undo_action,
                 )
             )
     run.command_undos = adjusted_command_undos
@@ -267,9 +436,7 @@ def apply_explosion(run: RunState, x: int, y: int, radius: int, owner: str) -> N
 def update_hazards(run: RunState, *, advance_bombs: bool) -> None:
     remaining_bombs: list[Bomb] = []
     for bomb in run.bombs:
-        if advance_bombs:
-            bomb.fuse -= 1
-        if bomb.fuse < 0:
+        if bomb.advance(advance_fuse=advance_bombs):
             apply_explosion(run, bomb.x, bomb.y, bomb.radius, bomb.owner)
             run.log(f"{bomb.owner.upper()} bomb detonated.")
         else:
@@ -277,46 +444,18 @@ def update_hazards(run: RunState, *, advance_bombs: bool) -> None:
     run.bombs = remaining_bombs
 
     remaining_mines: list[Mine] = []
+    enemy_heads = {
+        (enemy.head.x, enemy.head.y)
+        for enemy in active_enemies_for_run(run)
+        if not enemy.dead
+    }
     for mine in run.mines:
-        triggered = False
-        for enemy in active_enemies_for_run(run):
-            if enemy.dead:
-                continue
-            if manhattan((mine.x, mine.y), (enemy.head.x, enemy.head.y)) <= mine.radius:
-                apply_explosion(run, mine.x, mine.y, 1, "mine")
-                run.log("Mine triggered.")
-                triggered = True
-                break
-        if not triggered:
+        if mine.triggered_by(enemy_heads, manhattan):
+            apply_explosion(run, mine.x, mine.y, 1, "mine")
+            run.log("Mine triggered.")
+        else:
             remaining_mines.append(mine)
     run.mines = remaining_mines
-
-
-def line_of_floor(sector: Sector, x: int, y: int, steps: int, direction: str, blockers: set[tuple[int, int]]) -> tuple[int, int]:
-    dx, dy = step_from_direction(direction)
-    cursor = (x, y)
-    for _ in range(steps):
-        nxt = cursor[0] + dx, cursor[1] + dy
-        ensure_generated_around(sector, nxt, 1)
-        if nxt in sector.walls or nxt in blockers:
-            break
-        cursor = nxt
-    return cursor
-
-
-def dash_head_target(run: RunState, steps: int) -> tuple[int, int] | None:
-    dx, dy = step_from_direction(run.direction)
-    target = (run.head.x + dx * steps, run.head.y + dy * steps)
-    ensure_generated_around(run.sector, target, 1)
-    if target in run.sector.walls:
-        return None
-    if target in body_positions(run.body):
-        return None
-    if target in wreckage_positions(run):
-        return None
-    if target in enemy_positions(active_enemies_for_run(run)):
-        return None
-    return target
 
 
 def on_exit(sector: Sector, position: tuple[int, int]) -> bool:
@@ -356,124 +495,34 @@ def reset_extract_attempt(run: RunState) -> None:
     run.extract_matched_indices.clear()
 
 
-def ping_line(start: tuple[int, int], target: tuple[int, int], max_tiles: int) -> list[tuple[int, int]]:
-    x0, y0 = start
-    x1, y1 = target
-    if start == target or max_tiles <= 0:
-        return []
-
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    x, y = x0, y0
-    cells: list[tuple[int, int]] = []
-
-    while (x, y) != (x1, y1) and len(cells) < max_tiles:
-        e2 = err * 2
-        if e2 >= dy:
-            err += dy
-            x += sx
-        if e2 <= dx:
-            err += dx
-            y += sy
-        cells.append((x, y))
-    return cells
-
-
-def use_ping_command(run: RunState, command: str) -> bool:
-    target_spec = PING_TARGETS.get(command)
-    if target_spec is None:
-        return False
-    if run.inventory.get("ping", 0) <= 0:
-        run.log("PING unavailable.")
-        return True
-
-    label, resolver = target_spec
-    target = resolver(run)
-    if target is None:
-        run.log(f"{command.upper()} found no target.")
-        return True
-
-    run.inventory["ping"] -= 1
-    run.ping_path = ping_line((run.head.x, run.head.y), target, PING_DRAW_DISTANCE)
-    run.ping_ticks = PING_DURATION_TICKS
-    run.log(f"{command.upper()} traced {label}.")
-    return True
-
-
-def use_ability(run: RunState, name: str) -> Bomb | Mine | tuple[int, int] | None:
-    if run.inventory.get(name, 0) <= 0:
-        run.log(f"{name.upper()} unavailable.")
-        return None
-    run.inventory[name] -= 1
-    if name == "zap":
-        enemy = closest_enemy(run)
-        if enemy is None:
-            run.log("ZAP found no target.")
-            run.inventory[name] += 1
-            return None
-        kill_enemy(run, enemy, "zap")
-    elif name == "bomb":
-        recent_segments = list(run.body)[-4:]
-        bomb_cells = tuple((segment.x, segment.y) for segment in recent_segments) if len(recent_segments) == 4 else ()
-        center = bomb_cells[1] if len(bomb_cells) == 4 else (run.head.x, run.head.y)
-        bomb = Bomb(center[0], center[1], fuse=6, radius=2, cells=bomb_cells)
-        run.bombs.append(bomb)
-        run.log("BOMB armed. Fuse: 5.")
-        return bomb
-    elif name == "mine":
-        mine = Mine(run.head.x, run.head.y)
-        run.mines.append(mine)
-        run.log("MINE deployed.")
-        return mine
-    elif name == "silence":
-        run.silence_ticks = 20
-        run.log("SILENCE injected. Enemies paused for 20 ticks.")
-    elif name == "dash":
-        target = dash_head_target(run, 4)
-        if target is None:
-            run.log("DASH obstructed.")
-            run.inventory[name] += 1
-            return None
-        run.log("DASH executed.")
-        return target
-    return None
-
-
 def append_command_undo(
     run: RunState,
     *,
     step_index: int,
     previous_pending: str,
-    refund_ability: str | None = None,
-    bomb: Bomb | None = None,
-    mine: Mine | None = None,
+    undo_action: UndoAction | None = None,
 ) -> None:
     run.command_undos.append(
         CommandUndo(
             step_index=step_index,
             previous_pending=previous_pending,
-            refund_ability=refund_ability,
-            bomb=bomb,
-            mine=mine,
+            undo_action=undo_action,
         )
     )
 
 
 def undo_command_effect(run: RunState, undo: CommandUndo) -> None:
-    refunded = False
-    if undo.refund_ability == "bomb" and undo.bomb in run.bombs:
-        run.bombs.remove(undo.bomb)
-        run.inventory["bomb"] = run.inventory.get("bomb", 0) + 1
-        refunded = True
-    elif undo.refund_ability == "mine" and undo.mine in run.mines:
-        run.mines.remove(undo.mine)
-        run.inventory["mine"] = run.inventory.get("mine", 0) + 1
-        refunded = True
-    if refunded:
-        run.log(f"{undo.refund_ability.upper()} rewound.")
+    action = undo.undo_action
+    if action is None:
+        return
+    if action.kind == "remove_world_object" and action.object_id is not None:
+        removed = WorldController(run).remove_object(action.object_id)
+        if removed and action.inventory_name is not None:
+            run.inventory[action.inventory_name] = (
+                run.inventory.get(action.inventory_name, 0) + 1
+            )
+        if removed and action.label is not None:
+            run.log(f"{action.label} rewound.")
 
 
 def maybe_collect_byte(run: RunState, position: tuple[int, int] | None = None) -> None:
@@ -605,56 +654,52 @@ def begin_or_update_pickup(run: RunState, typed_char: str, position: tuple[int, 
     return True
 
 
-def resolve_inline_command(run: RunState) -> tuple[int, int] | None:
+def resolve_inline_command(
+    run: RunState,
+    player: PlayerController,
+    world: WorldController,
+    typed_char: str,
+) -> None:
     if not run.pending_command:
-        return None
+        return
     suffix = run.pending_command.lower()
-    commands = sorted(("status", "help", *PING_TARGETS.keys(), *INLINE_ABILITY_NAMES, *DIRECTIONS.keys()), key=len, reverse=True)
+    commands = sorted(
+        ("status", "help", *ABILITY_COMMANDS, *DIRECTIONS.keys()),
+        key=len,
+        reverse=True,
+    )
     for command in commands:
         if not suffix.endswith(command):
             continue
         previous_pending = run.pending_command[:-1]
-        step_index = len(run.body)
-        movement_override: tuple[int, int] | None = None
+        step_index = player.step_index
         if command in DIRECTIONS:
             run.direction_undos.append((step_index, run.direction, previous_pending))
             run.direction = command
-        elif command in PING_TARGETS:
-            use_ping_command(run, command)
-            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
-        elif command in ABILITY_NAMES:
-            effect = use_ability(run, command)
-            if command == "bomb":
-                append_command_undo(
-                    run,
-                    step_index=step_index,
-                    previous_pending=previous_pending,
-                    refund_ability="bomb" if isinstance(effect, Bomb) else None,
-                    bomb=effect if isinstance(effect, Bomb) else None,
+        elif command in ABILITY_COMMANDS:
+            ability = get_ability(command)
+            if ability is not None:
+                ability.execute(
+                    AbilityContext(
+                        player=player,
+                        world=world,
+                        typed_char=typed_char,
+                        command=command,
+                    )
                 )
-            elif command == "mine":
-                append_command_undo(
-                    run,
-                    step_index=step_index,
-                    previous_pending=previous_pending,
-                    refund_ability="mine" if isinstance(effect, Mine) else None,
-                    mine=effect if isinstance(effect, Mine) else None,
-                )
-            elif command == "dash":
-                append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
-                if isinstance(effect, tuple):
-                    movement_override = effect
-            else:
-                append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
+            player.commit_command(previous_pending)
         elif command == "help":
             show_run_help(run)
-            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
+            append_command_undo(
+                run, step_index=step_index, previous_pending=previous_pending
+            )
         else:
             show_run_status(run)
-            append_command_undo(run, step_index=step_index, previous_pending=previous_pending)
+            append_command_undo(
+                run, step_index=step_index, previous_pending=previous_pending
+            )
         run.pending_command = ""
-        return movement_override
-    return None
+        return
 
 
 def advance_player(run: RunState, typed_char: str) -> None:
@@ -668,6 +713,14 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
     ny = current_head.y + dy
     next_pos = (nx, ny)
     ensure_generated_around(run.sector, next_pos, 1)
+    player = PlayerController(
+        run,
+        typed_char=typed_char,
+        current_position=(current_head.x, current_head.y),
+        next_position=next_pos,
+        step_index=len(run.body),
+    )
+    world = WorldController(run)
 
     def collision_cause(position: tuple[int, int]) -> str | None:
         if position in run.sector.walls:
@@ -680,18 +733,17 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
             return "enemy collision"
         return None
 
-    dash_candidate = record_command and (run.pending_command + typed_char).lower().endswith("dash")
-    if not dash_candidate:
-        cause = collision_cause(next_pos)
-        if cause is not None:
+    cause = collision_cause(next_pos)
+    if cause is not None:
+        dash_candidate = record_command and (
+            run.pending_command + typed_char
+        ).lower().endswith("dash")
+        if not dash_candidate:
             run.game_over = True
             run.cause = cause
             return
 
-    current_position = (current_head.x, current_head.y)
-    movement_target = next_pos
-    dash_jump_start: tuple[int, int] | None = None
-    dash_v_position: tuple[int, int] | None = None
+    current_position = player.current_position
     if record_command:
         run.pending_command += typed_char
         extract_touched = begin_or_update_extract(run, typed_char, current_position)
@@ -699,13 +751,9 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
             return
         pickup_touched = False if extract_touched else begin_or_update_pickup(run, typed_char, current_position)
         if not extract_touched and not pickup_touched:
-            dash_target = resolve_inline_command(run)
-            if dash_target is not None:
-                movement_target = dash_target
-                dash_jump_start = next_pos
-                dash_v_position = (movement_target[0] - dx, movement_target[1] - dy)
+            resolve_inline_command(run, player, world, typed_char)
 
-    cause = collision_cause(movement_target)
+    cause = collision_cause(player.movement_target)
     if cause is not None:
         run.game_over = True
         run.cause = cause
@@ -714,14 +762,22 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
     current_head.ch = typed_char
     add_typed_bytes(run, 1)
     maybe_collect_byte(run, current_position)
-    if dash_jump_start is not None:
-        run.body.append(Segment(dash_jump_start[0], dash_jump_start[1], "^"))
-        if dash_v_position != dash_jump_start:
-            run.body.append(Segment(dash_v_position[0], dash_v_position[1], "v"))
-        run.body.append(Segment(movement_target[0], movement_target[1], " "))
-        maybe_collect_byte(run, movement_target)
+    if player.dash_jump_start is not None:
+        run.body.append(
+            Segment(player.dash_jump_start[0], player.dash_jump_start[1], "^")
+        )
+        if player.dash_v_position != player.dash_jump_start:
+            run.body.append(
+                Segment(player.dash_v_position[0], player.dash_v_position[1], "v")
+            )
+        run.body.append(
+            Segment(player.movement_target[0], player.movement_target[1], " ")
+        )
+        maybe_collect_byte(run, player.movement_target)
     else:
-        run.body.append(Segment(movement_target[0], movement_target[1], " "))
+        run.body.append(
+            Segment(player.movement_target[0], player.movement_target[1], " ")
+        )
 
 
 def retract_player(run: RunState) -> None:
@@ -867,10 +923,7 @@ def advance_enemies(run: RunState, save: SaveData, rng: random.Random, *, grow: 
 def decay_effects(run: RunState) -> None:
     if run.blind_ticks > 0:
         run.blind_ticks -= 1
-    if run.ping_ticks > 0:
-        run.ping_ticks -= 1
-        if run.ping_ticks == 0:
-            run.ping_path.clear()
+    run.pings = [ping for ping in run.pings if not ping.advance()]
     active_explosions(run)
     for segment in run.body:
         if segment.infected > 0:
