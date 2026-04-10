@@ -6,19 +6,13 @@ from collections import deque
 from typing import Callable
 
 from .abilities import ABILITY_COMMANDS, AbilityContext, get_ability
-from .constants import ABILITY_NAMES, DIRECTIONS, EXIT_TEXT, MAX_ENEMY_LENGTH
-from .generation import chunk_coords, ensure_generated_around, exit_cells, generate_sector
-from .models import Bomb, CommandUndo, Debris, Enemy, ExplosionEffect, ExplosionParticle, ExtractAttempt, Mine, PickupAttempt, PingTrace, RunState, SaveData, Sector, Segment, UndoAction
+from .constants import ABILITY_NAMES, DIRECTIONS, EXIT_TEXT
+from .enemies import active_enemies_for_run, update_enemies
+from .generation import ensure_generated_around, exit_cells, generate_sector
+from .models import Bomb, CommandUndo, Debris, Enemy, ExplosionEffect, ExplosionParticle, ExtractAttempt, Mine, PickupAttempt, RunState, SaveData, Sector, Segment, UndoAction
+from .player_controller import PlayerController
 from .utils import manhattan
-
-
-def active_enemy_limit(run: RunState) -> int:
-    return 2 + run.ticks // 90
-
-
-def active_enemies_for_run(run: RunState) -> list[Enemy]:
-    living = [enemy for enemy in run.sector.enemies if not enemy.dead]
-    return living[: active_enemy_limit(run)]
+from .world_controller import WorldController
 
 
 def wreckage_positions(run: RunState) -> set[tuple[int, int]]:
@@ -61,187 +55,30 @@ def body_positions(body: deque[Segment]) -> set[tuple[int, int]]:
     return {(segment.x, segment.y) for segment in body}
 
 
-class PlayerController:
-    def __init__(
-        self,
-        run: RunState,
-        *,
-        typed_char: str,
-        current_position: tuple[int, int],
-        next_position: tuple[int, int],
-        step_index: int,
-    ) -> None:
-        self.run = run
-        self.typed_char = typed_char
-        self.current_position = current_position
-        self.next_position = next_position
-        self.step_index = step_index
-        self.movement_target = next_position
-        self.dash_jump_start: tuple[int, int] | None = None
-        self.dash_v_position: tuple[int, int] | None = None
-        self._undo_action: UndoAction | None = None
-
-    def head_position(self) -> tuple[int, int]:
-        return self.current_position
-
-    def direction(self) -> str:
-        return self.run.direction
-
-    def inventory_available(self, name: str) -> bool:
-        return self.run.inventory.get(name, 0) > 0
-
-    def consume_inventory(self, name: str) -> bool:
-        if not self.inventory_available(name):
-            return False
-        self.run.inventory[name] -= 1
-        return True
-
-    def refund_inventory(self, name: str) -> None:
-        self.run.inventory[name] = self.run.inventory.get(name, 0) + 1
-
-    def queue_dash(self, target: tuple[int, int]) -> None:
-        dx = target[0] - self.next_position[0]
-        dy = target[1] - self.next_position[1]
-        self.movement_target = target
-        self.dash_jump_start = self.next_position
-        self.dash_v_position = (target[0] - max(-1, min(1, dx)), target[1] - max(-1, min(1, dy)))
-
-    def attach_undo_action(self, action: UndoAction) -> None:
-        self._undo_action = action
-
-    def commit_command(self, previous_pending: str) -> None:
-        append_command_undo(
-            self.run,
-            step_index=self.step_index,
-            previous_pending=previous_pending,
-            undo_action=self._undo_action,
-        )
-        self._undo_action = None
-
-    def log(self, message: str) -> None:
-        self.run.log(message)
+def create_player_controller(
+    run: RunState,
+    *,
+    typed_char: str,
+    current_position: tuple[int, int],
+    next_position: tuple[int, int],
+    step_index: int,
+) -> PlayerController:
+    return PlayerController(
+        run,
+        typed_char=typed_char,
+        current_position=current_position,
+        next_position=next_position,
+        step_index=step_index,
+        append_command_undo=append_command_undo,
+    )
 
 
-class WorldController:
-    def __init__(self, run: RunState) -> None:
-        self.run = run
-
-    def closest_enemy(self) -> Enemy | None:
-        living = active_enemies_for_run(self.run)
-        if not living:
-            return None
-        return min(
-            living,
-            key=lambda enemy: manhattan(
-                (enemy.head.x, enemy.head.y), (self.run.head.x, self.run.head.y)
-            ),
-        )
-
-    def kill_enemy(self, enemy: Enemy, reason: str) -> None:
-        kill_enemy(self.run, enemy, reason)
-
-    def next_object_id(self, prefix: str) -> str:
-        self.run.next_object_id += 1
-        return f"{prefix}:{self.run.next_object_id}"
-
-    def remove_object(self, object_id: str) -> bool:
-        for attr in ("bombs", "mines", "pings"):
-            collection = getattr(self.run, attr)
-            for item in list(collection):
-                if item.object_id == object_id:
-                    collection.remove(item)
-                    return True
-        return False
-
-    def spawn_bomb_from_player(self, player: PlayerController) -> str:
-        recent_segments = list(self.run.body)[-4:]
-        bomb_cells = (
-            tuple((segment.x, segment.y) for segment in recent_segments)
-            if len(recent_segments) == 4
-            else ()
-        )
-        center = (
-            bomb_cells[1]
-            if len(bomb_cells) == 4
-            else player.head_position()
-        )
-        bomb = Bomb(
-            object_id=self.next_object_id("bomb"),
-            x=center[0],
-            y=center[1],
-            fuse=6,
-            radius=2,
-            cells=bomb_cells,
-        )
-        self.run.bombs.append(bomb)
-        return bomb.object_id
-
-    def spawn_mine_at_player(self, player: PlayerController) -> str:
-        mine = Mine(
-            object_id=self.next_object_id("mine"),
-            x=player.head_position()[0],
-            y=player.head_position()[1],
-        )
-        self.run.mines.append(mine)
-        return mine.object_id
-
-    def ping_exit_target(self) -> tuple[int, int] | None:
-        return self.run.sector.exit[0] + 3, self.run.sector.exit[1]
-
-    def trace_line(
-        self, start: tuple[int, int], target: tuple[int, int], max_tiles: int
-    ) -> list[tuple[int, int]]:
-        x0, y0 = start
-        x1, y1 = target
-        if start == target or max_tiles <= 0:
-            return []
-
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        x, y = x0, y0
-        cells: list[tuple[int, int]] = []
-
-        while (x, y) != (x1, y1) and len(cells) < max_tiles:
-            e2 = err * 2
-            if e2 >= dy:
-                err += dy
-                x += sx
-            if e2 <= dx:
-                err += dx
-                y += sy
-            cells.append((x, y))
-        return cells
-
-    def spawn_ping_trace(self, path: list[tuple[int, int]], duration: int) -> str:
-        ping = PingTrace(
-            object_id=self.next_object_id("ping"),
-            path=path,
-            ticks_remaining=duration,
-        )
-        self.run.pings.append(ping)
-        return ping.object_id
-
-    def set_silence_ticks(self, ticks: int) -> None:
-        self.run.silence_ticks = max(self.run.silence_ticks, ticks)
-
-    def find_dash_target(
-        self, direction: str, steps: int
-    ) -> tuple[int, int] | None:
-        dx, dy = step_from_direction(direction)
-        target = (self.run.head.x + dx * steps, self.run.head.y + dy * steps)
-        ensure_generated_around(self.run.sector, target, 1)
-        if target in self.run.sector.walls:
-            return None
-        if target in body_positions(self.run.body):
-            return None
-        if target in wreckage_positions(self.run):
-            return None
-        if target in enemy_positions(active_enemies_for_run(self.run)):
-            return None
-        return target
+def create_world_controller(run: RunState) -> WorldController:
+    return WorldController(
+        run,
+        active_enemies_for_run=active_enemies_for_run,
+        kill_enemy=kill_enemy,
+    )
 
 
 def add_typed_bytes(run: RunState, amount: int) -> None:
@@ -326,13 +163,6 @@ def active_explosions(run: RunState, *, now: float | None = None) -> list[Explos
     active = [effect for effect in run.explosions if now - effect.started_at < effect.duration]
     run.explosions = active
     return active
-
-
-def closest_enemy(run: RunState) -> Enemy | None:
-    living = active_enemies_for_run(run)
-    if not living:
-        return None
-    return min(living, key=lambda enemy: manhattan((enemy.head.x, enemy.head.y), (run.head.x, run.head.y)))
 
 
 def kill_enemy(run: RunState, enemy: Enemy, reason: str) -> None:
@@ -451,7 +281,7 @@ def update_hazards(run: RunState, *, advance_bombs: bool) -> None:
     }
     for mine in run.mines:
         if mine.triggered_by(enemy_heads, manhattan):
-            apply_explosion(run, mine.x, mine.y, 1, "mine")
+            apply_explosion(run, mine.x, mine.y, mine.explosion_radius, "mine")
             run.log("Mine triggered.")
         else:
             remaining_mines.append(mine)
@@ -516,7 +346,7 @@ def undo_command_effect(run: RunState, undo: CommandUndo) -> None:
     if action is None:
         return
     if action.kind == "remove_world_object" and action.object_id is not None:
-        removed = WorldController(run).remove_object(action.object_id)
+        removed = create_world_controller(run).remove_object(action.object_id)
         if removed and action.inventory_name is not None:
             run.inventory[action.inventory_name] = (
                 run.inventory.get(action.inventory_name, 0) + 1
@@ -713,14 +543,14 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
     ny = current_head.y + dy
     next_pos = (nx, ny)
     ensure_generated_around(run.sector, next_pos, 1)
-    player = PlayerController(
+    player = create_player_controller(
         run,
         typed_char=typed_char,
         current_position=(current_head.x, current_head.y),
         next_position=next_pos,
         step_index=len(run.body),
     )
-    world = WorldController(run)
+    world = create_world_controller(run)
 
     def collision_cause(position: tuple[int, int]) -> str | None:
         if position in run.sector.walls:
@@ -749,7 +579,11 @@ def advance_player_with_mode(run: RunState, typed_char: str, *, record_command: 
         extract_touched = begin_or_update_extract(run, typed_char, current_position)
         if run.game_over:
             return
-        pickup_touched = False if extract_touched else begin_or_update_pickup(run, typed_char, current_position)
+        pickup_touched = (
+            False
+            if extract_touched
+            else begin_or_update_pickup(run, typed_char, current_position)
+        )
         if not extract_touched and not pickup_touched:
             resolve_inline_command(run, player, world, typed_char)
 
@@ -811,115 +645,6 @@ def retract_player(run: RunState) -> None:
     reset_extract_attempt(run)
 
 
-def resolve_enemy_step(
-    run: RunState,
-    enemy: Enemy,
-    rng: random.Random,
-    occupied: set[tuple[int, int]],
-) -> tuple[int, int]:
-    target = (run.head.x, run.head.y)
-    if enemy.kind == "virus":
-        target_cells = [segment for segment in run.body if segment.infected <= 0]
-        if target_cells:
-            target_segment = min(target_cells, key=lambda segment: manhattan((segment.x, segment.y), (enemy.head.x, enemy.head.y)))
-            target = (target_segment.x, target_segment.y)
-    own_cells = {(segment.x, segment.y) for segment in enemy.body}
-    candidates: list[tuple[int, int]] = []
-    for direction in DIRECTIONS.values():
-        nxt = enemy.head.x + direction[0], enemy.head.y + direction[1]
-        if chunk_coords(nxt[0], nxt[1], run.sector.chunk_size) not in run.sector.generated_chunks:
-            continue
-        if nxt in run.sector.walls or nxt in occupied or nxt in own_cells:
-            continue
-        candidates.append(nxt)
-    if not candidates:
-        return enemy.head.x, enemy.head.y
-    if rng.random() < enemy.speed_bias:
-        best_distance = min(manhattan(candidate, target) for candidate in candidates)
-        best = [candidate for candidate in candidates if manhattan(candidate, target) == best_distance]
-        return rng.choice(best)
-    return rng.choice(candidates)
-
-
-def resolve_enemy_effects(run: RunState, enemy: Enemy, save: SaveData) -> None:
-    if enemy.dead:
-        return
-    head = (enemy.head.x, enemy.head.y)
-    trail_hits = [index for index, segment in enumerate(run.body) if (segment.x, segment.y) == head]
-    if trail_hits and trail_hits[-1] == len(run.body) - 1:
-        run.game_over = True
-        run.cause = f"{enemy.kind} reached your cursor"
-        return
-    if trail_hits:
-        trim_player_history(run, trail_hits[-1] + 1, enemy.kind)
-        return
-
-    if enemy.kind == "virus":
-        nearest = min(run.body, key=lambda segment: manhattan((segment.x, segment.y), head))
-        if manhattan((nearest.x, nearest.y), head) <= 1:
-            nearest.infected = max(nearest.infected, 6)
-            stolen = min(14, run.bytes_collected)
-            if stolen:
-                run.bytes_collected -= stolen
-                run.log(f"VIRUS siphoned {stolen} bytes.")
-    elif enemy.kind == "blinder":
-        if manhattan(head, (run.head.x, run.head.y)) <= 3:
-            duration = max(4, 12 - save.upgrades["focus"] * 3)
-            run.blind_ticks = max(run.blind_ticks, duration)
-            run.log("BLINDER corrupted the feed.")
-    elif enemy.kind == "fuse":
-        if enemy.fuse_timer > 0:
-            enemy.fuse_timer -= 1
-            if enemy.fuse_timer == 0:
-                apply_explosion(run, enemy.head.x, enemy.head.y, 2, "fuse")
-                kill_enemy(run, enemy, "chain")
-                run.log("FUSE detonated.")
-        elif any(manhattan((segment.x, segment.y), head) <= 2 for segment in run.body):
-            enemy.fuse_timer = 2
-            run.log("FUSE armed.")
-
-
-def advance_enemies(run: RunState, save: SaveData, rng: random.Random, *, grow: bool = False) -> None:
-    if run.silence_ticks > 0:
-        run.silence_ticks -= 1
-        return
-
-    ensure_generated_around(run.sector, (run.head.x, run.head.y))
-    active_enemies = active_enemies_for_run(run)
-    occupied = run.sector.walls | body_positions(run.body) | wreckage_positions(run)
-    for enemy in active_enemies:
-        if enemy.dead:
-            continue
-        for segment in enemy.body:
-            occupied.add((segment.x, segment.y))
-
-    for enemy in active_enemies:
-        if enemy.dead:
-            continue
-        for segment in enemy.body:
-            occupied.discard((segment.x, segment.y))
-        previous_head = (enemy.head.x, enemy.head.y)
-        next_pos = resolve_enemy_step(run, enemy, rng, occupied)
-        if next_pos == previous_head:
-            apply_explosion(run, enemy.head.x, enemy.head.y, 1, "stuck")
-            run.log(f"{enemy.kind.upper()} locked up and exploded.")
-            for piece in run.wreckage:
-                occupied.add((piece.x, piece.y))
-            if run.game_over:
-                return
-            continue
-        enemy.heading = (next_pos[0] - enemy.head.x, next_pos[1] - enemy.head.y)
-        enemy.body.append(Segment(next_pos[0], next_pos[1], random.choice("!$%&*+?{}[]/\\<>=")))
-        should_grow = grow and len(enemy.body) <= MAX_ENEMY_LENGTH
-        if not should_grow:
-            enemy.body.popleft()
-        for segment in enemy.body:
-            occupied.add((segment.x, segment.y))
-        resolve_enemy_effects(run, enemy, save)
-        if run.game_over:
-            return
-
-
 def decay_effects(run: RunState) -> None:
     if run.blind_ticks > 0:
         run.blind_ticks -= 1
@@ -940,7 +665,18 @@ def tick(run: RunState, save: SaveData, rng: random.Random, *, player_action: Ca
     update_hazards(run, advance_bombs=True)
     if run.game_over:
         return
-    advance_enemies(run, save, rng, grow=reason == "key")
+    update_enemies(
+        run,
+        save,
+        create_world_controller(run),
+        rng,
+        grow=reason == "key",
+        body_positions=body_positions,
+        wreckage_positions=wreckage_positions,
+        trim_player_history=trim_player_history,
+        apply_explosion=apply_explosion,
+        kill_enemy=kill_enemy,
+    )
     update_hazards(run, advance_bombs=False)
     decay_effects(run)
     run.ticks += 1

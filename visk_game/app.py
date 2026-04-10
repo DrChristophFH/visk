@@ -4,6 +4,8 @@ import random
 import sys
 from collections import deque
 
+from pyinstrument import Profiler
+
 from .audio import AudioManager
 from .constants import DIRECTIONS, SHOP_ITEMS
 from .gameplay import advance_player, create_run, retract_player, tick
@@ -21,6 +23,7 @@ class ViskApp:
         self.rng = random.Random()
         self.renderer = Renderer()
         self.audio = AudioManager()
+        self.profile_next_tick = False
         self.scenes = {
             "menu": MenuScene(self.renderer, self.session),
             "shop": ShopScene(self.renderer, self.session),
@@ -218,23 +221,45 @@ class ViskApp:
         if key == "ESC":
             self.state = "menu"
             return
+        # if key == " ":
+        #     self.profile_next_tick = True
+        #     return
         if key == "BACKSPACE":
-            tick(
-                self.run,
-                self.save,
-                self.rng,
+            self.run_timed_tick(
                 player_action=lambda: retract_player(self.run),
                 reason="key",
             )
             return
         if len(key) == 1 and key.isprintable() and not key.isspace():
+            self.run_timed_tick(
+                player_action=lambda key=key: advance_player(self.run, key),
+                reason="key",
+            )
+
+    def run_timed_tick(
+        self,
+        *,
+        player_action,
+        reason: str,
+    ) -> None:
+        if self.run is None:
+            return
+        profiler = Profiler() if self.profile_next_tick else None
+        if profiler is not None:
+            profiler.start()
+        try:
             tick(
                 self.run,
                 self.save,
                 self.rng,
-                player_action=lambda key=key: advance_player(self.run, key),
-                reason="key",
+                player_action=player_action,
+                reason=reason,
             )
+        finally:
+            if profiler is not None:
+                profiler.stop()
+                self.profile_next_tick = False
+                profiler.open_in_browser()
 
     def run_loop(self) -> None:
         try:
@@ -264,10 +289,7 @@ class ViskApp:
                             and not self.run.game_over
                             and self.run.hardcore
                         ):
-                            tick(
-                                self.run,
-                                self.save,
-                                self.rng,
+                            self.run_timed_tick(
                                 player_action=None,
                                 reason="idle",
                             )

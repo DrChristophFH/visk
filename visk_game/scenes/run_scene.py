@@ -4,7 +4,8 @@ import math
 import time
 
 from ..constants import ABILITY_NAMES, EXIT_TEXT, THEMES
-from ..gameplay import active_enemies_for_run, active_explosions
+from ..enemies import active_enemies_for_run
+from ..gameplay import active_explosions
 from ..generation import ensure_generated_rect
 from ..models import Canvas, Debris, Enemy, ExplosionEffect, Pickup, RunState, Theme
 from ..scene_types import SceneLayer, SceneRenderResult
@@ -359,13 +360,14 @@ class RunScene(BaseScene):
             if screen := on_screen(piece.x, piece.y):
                 put(screen[0], screen[1], piece.ch or " ", fg_color=debris_color(theme, piece, now=now))
 
-        for enemy in active_enemies_for_run(run):
+        active_enemies = active_enemies_for_run(run)
+        for enemy in active_enemies:
             for idx, segment in enumerate(enemy.body):
                 if screen := on_screen(segment.x, segment.y):
                     put(screen[0], screen[1], segment.ch, fg_color=enemy_segment_color(theme, enemy, idx))
 
         blink = int(time.monotonic() * 2.6) % 2 == 0
-        for enemy in active_enemies_for_run(run):
+        for enemy in active_enemies:
             head_color = enemy_head_color(theme, enemy)
             if screen := on_screen(enemy.head.x, enemy.head.y):
                 flash_fg, flash_bg = invert_colors(head_color, theme["floor"], blink)

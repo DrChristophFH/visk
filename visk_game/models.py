@@ -224,19 +224,26 @@ class Mine:
     object_id: str
     x: int
     y: int
-    radius: int = 1
+    trigger_radius: int = 3
+    explosion_radius: int = 3
 
     def triggered_by(self, enemy_positions: set[tuple[int, int]], manhattan) -> bool:
-        return any(manhattan((self.x, self.y), position) <= self.radius for position in enemy_positions)
+        return any(
+            manhattan((self.x, self.y), position) <= self.trigger_radius
+            for position in enemy_positions
+        )
 
     def render(self, on_screen, put, theme, *, blink: bool, invert_colors) -> None:
         if screen := on_screen(self.x, self.y):
-            mine_fg, mine_bg = invert_colors(
-                mix(theme["accent"], theme["enemy"], 0.25),
-                theme["floor"],
-                blink,
+            base_color = theme["player"]
+            flash_color = (255, 96, 96)
+            put(
+                screen[0],
+                screen[1],
+                "i",
+                fg_color=flash_color if blink else base_color,
+                bold=True,
             )
-            put(screen[0], screen[1], "^", fg_color=mine_fg, bg_color=mine_bg, bold=True)
 
 
 @dataclass
@@ -301,6 +308,7 @@ class Enemy:
     speed_bias: float = 0.75
     fuse_timer: int = 0
     stunned: int = 0
+    last_move_mode: str = "init"
     dead: bool = False
 
     @property

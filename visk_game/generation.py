@@ -3,7 +3,15 @@ from __future__ import annotations
 import random
 from collections import deque
 
-from .constants import ABILITY_NAMES, CHUNK_SIZE, DIRECTIONS, EXIT_TEXT, GENERATION_RADIUS, SECTOR_NAMES, THEMES
+from .constants import (
+    ABILITY_NAMES,
+    CHUNK_SIZE,
+    DIRECTIONS,
+    EXIT_TEXT,
+    GENERATION_RADIUS,
+    SECTOR_NAMES,
+    THEMES,
+)
 from .models import ByteShard, Enemy, Pickup, SaveData, Sector, Segment
 from .utils import hash_noise, manhattan, random_word
 
@@ -88,7 +96,9 @@ def diamond_shape(cx: int, cy: int, radius: int) -> set[tuple[int, int]]:
     return cells
 
 
-def l_shape(x: int, y: int, width: int, height: int, horizontal_first: bool) -> set[tuple[int, int]]:
+def l_shape(
+    x: int, y: int, width: int, height: int, horizontal_first: bool
+) -> set[tuple[int, int]]:
     cells: set[tuple[int, int]] = set()
     if horizontal_first:
         for xx in range(x, x + width):
@@ -117,7 +127,9 @@ def chunk_origin(cx: int, cy: int, chunk_size: int = CHUNK_SIZE) -> tuple[int, i
     return cx * chunk_size, cy * chunk_size
 
 
-def reserve_radius(center: tuple[int, int], point: tuple[int, int], radius: int) -> bool:
+def reserve_radius(
+    center: tuple[int, int], point: tuple[int, int], radius: int
+) -> bool:
     return manhattan(center, point) <= radius
 
 
@@ -178,8 +190,20 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
     rng = random.Random(hash_noise(cx, cy, sector.seed))
     occupied = sector_occupied_cells(sector)
     base_x, base_y = chunk_origin(cx, cy, sector.chunk_size)
-    near_start = manhattan((base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2), sector.start) <= sector.chunk_size * 2
-    near_exit = manhattan((base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2), exit_center(sector.exit)) <= sector.chunk_size * 2
+    near_start = (
+        manhattan(
+            (base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2),
+            sector.start,
+        )
+        <= sector.chunk_size * 2
+    )
+    near_exit = (
+        manhattan(
+            (base_x + sector.chunk_size // 2, base_y + sector.chunk_size // 2),
+            exit_center(sector.exit),
+        )
+        <= sector.chunk_size * 2
+    )
 
     shape_count = rng.randint(0, 2) if near_start else rng.randint(1, 4)
     for _ in range(shape_count):
@@ -192,8 +216,12 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
             cells = box_shape(x, y, w, h)
         elif shape_type == "diamond":
             radius = rng.randint(2, 4)
-            x = rng.randint(base_x + radius + 2, base_x + sector.chunk_size - radius - 3)
-            y = rng.randint(base_y + radius + 2, base_y + sector.chunk_size - radius - 3)
+            x = rng.randint(
+                base_x + radius + 2, base_x + sector.chunk_size - radius - 3
+            )
+            y = rng.randint(
+                base_y + radius + 2, base_y + sector.chunk_size - radius - 3
+            )
             cells = diamond_shape(x, y, radius)
         elif shape_type == "l":
             w = rng.randint(4, 8)
@@ -204,8 +232,14 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
         else:
             horizontal = rng.random() < 0.5
             length = rng.randint(5, 11)
-            x = rng.randint(base_x + 2, base_x + sector.chunk_size - (length if horizontal else 1) - 3)
-            y = rng.randint(base_y + 2, base_y + sector.chunk_size - (1 if horizontal else length) - 3)
+            x = rng.randint(
+                base_x + 2,
+                base_x + sector.chunk_size - (length if horizontal else 1) - 3,
+            )
+            y = rng.randint(
+                base_y + 2,
+                base_y + sector.chunk_size - (1 if horizontal else length) - 3,
+            )
             cells = bar_shape(x, y, length, horizontal)
         padded = set(cells)
         for cell_x, cell_y in list(cells):
@@ -246,20 +280,33 @@ def generate_chunk(sector: Sector, cx: int, cy: int) -> None:
         cells = {(x + offset, y) for offset in range(length)}
         if any(cell in occupied for cell in cells):
             continue
-        body = deque(Segment(x + offset, y, random_word(rng, 1)) for offset in range(length))
+        body = deque(
+            Segment(x + offset, y, random_word(rng, 1)) for offset in range(length)
+        )
         kind = rng.choice(("chaser", "virus", "blinder", "fuse"))
-        sector.enemies.append(Enemy(kind=kind, body=body, heading=(1, 0), speed_bias=0.85 if kind == "chaser" else 0.72))
+        sector.enemies.append(
+            Enemy(
+                kind=kind,
+                body=body,
+                heading=(1, 0),
+                speed_bias=0.99 if kind == "chaser" else 0.95,
+            )
+        )
         occupied.update(cells)
 
 
-def ensure_generated_around(sector: Sector, center: tuple[int, int], radius: int = GENERATION_RADIUS) -> None:
+def ensure_generated_around(
+    sector: Sector, center: tuple[int, int], radius: int = GENERATION_RADIUS
+) -> None:
     chunk_x, chunk_y = chunk_coords(center[0], center[1], sector.chunk_size)
     for cy in range(chunk_y - radius, chunk_y + radius + 1):
         for cx in range(chunk_x - radius, chunk_x + radius + 1):
             generate_chunk(sector, cx, cy)
 
 
-def ensure_generated_rect(sector: Sector, left: int, top: int, width: int, height: int) -> None:
+def ensure_generated_rect(
+    sector: Sector, left: int, top: int, width: int, height: int
+) -> None:
     start_cx, start_cy = chunk_coords(left, top, sector.chunk_size)
     end_cx, end_cy = chunk_coords(left + width, top + height, sector.chunk_size)
     for cy in range(start_cy - 1, end_cy + 2):
@@ -359,7 +406,9 @@ def place_sparse_obstacles(
         placed += 1
 
 
-def generate_sector(save: SaveData, *, seed: int | None = None) -> tuple[Sector, tuple[int, int]]:
+def generate_sector(
+    save: SaveData, *, seed: int | None = None
+) -> tuple[Sector, tuple[int, int]]:
     rng = random.Random(seed if seed is not None else random.randrange(1 << 30))
     start = (0, 0)
     distance = rng.randint(90, 140)
