@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 import time
 
 from .constants import ABILITY_NAMES, CREDITS_PAGE_LINES, RUN_ART, SHOP_ITEMS, THEMES
@@ -226,11 +227,26 @@ class Renderer:
         self.run_static_canvas: Canvas | None = None
         self.run_overlay_prev: dict[tuple[int, int], Cell] = {}
         self.run_camera_key: tuple[int, int, int, int, int, int] | None = None
+        self.viewport_cols = 120
+        self.viewport_rows = 38
 
     def reset_run_cache(self) -> None:
         self.run_static_canvas = None
         self.run_overlay_prev = {}
         self.run_camera_key = None
+
+    def get_viewport_size(self) -> tuple[int, int]:
+        cols, rows = shutil.get_terminal_size((120, 38))
+        self.viewport_cols = max(cols, 60)
+        self.viewport_rows = max(rows, 22)
+        return self.viewport_cols, self.viewport_rows
+
+    def credits_start_y(self, cols: int, rows: int) -> int:
+        max_text_width = max(20, cols - 6)
+        text_height = sum(
+            len(wrap_lines(line, max_text_width)) for line, _, _ in CREDITS_PAGE_LINES
+        )
+        return max(0, min(rows - 2, 2 + text_height + 1))
 
     def draw_panel(
         self,
@@ -872,9 +888,8 @@ class Renderer:
         credits: CreditsState | None,
         save: SaveData,
         shop_cursor: int,
-        cols: int,
-        rows: int,
     ) -> str:
+        cols, rows = self.get_viewport_size()
         optimized_run_frame = (
             state == "run"
             and run is not None
