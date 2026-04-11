@@ -2,16 +2,20 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .constants import CHUNK_SIZE, NOISE_GLYPHS
-from .utils import bg, fg, hash_noise, mix, style_reset
+from .utils import Colors, bg, fg, hash_noise, mix, style_reset
+
+if TYPE_CHECKING:
+    from .world_controller import WorldController
 
 
 Color = tuple[int, int, int]
 Theme = dict[str, Color | str]
 
 
-@dataclass
+@dataclass(slots=True)
 class Cell:
     ch: str = " "
     fg: Color | None = None
@@ -19,17 +23,27 @@ class Cell:
     bold: bool = False
 
     def is_transparent(self) -> bool:
-        return self.ch == " " and self.fg is None and self.bg is None and not self.bold
+        return self is TRANSPARENT_CELL or (
+            self.ch == " " and self.fg is None and self.bg is None and not self.bold
+        )
+
+
+TRANSPARENT_CELL = Cell()
 
 
 class Canvas:
     def __init__(self, width: int, height: int, background: Color | None) -> None:
         self.width = width
         self.height = height
-        self.cells = [
-            [Cell(" ", None, background, False) for _ in range(width)]
-            for _ in range(height)
-        ]
+        self.background = background
+        self._transparent_row = [TRANSPARENT_CELL] * width
+        if background is None:
+            self.cells = [self._transparent_row.copy() for _ in range(height)]
+        else:
+            self.cells = [
+                [Cell(" ", None, background, False) for _ in range(width)]
+                for _ in range(height)
+            ]
 
     @classmethod
     def transparent(cls, width: int, height: int) -> "Canvas":
@@ -38,10 +52,57 @@ class Canvas:
     def copy(self) -> "Canvas":
         clone = Canvas.transparent(self.width, self.height)
         clone.cells = [
-            [Cell(cell.ch, cell.fg, cell.bg, cell.bold) for cell in row]
+            [
+                cell
+                if cell is TRANSPARENT_CELL
+                else Cell(cell.ch, cell.fg, cell.bg, cell.bold)
+                for cell in row
+            ]
             for row in self.cells
         ]
         return clone
+
+    def shallow_copy(self) -> "Canvas":
+        clone = Canvas.transparent(self.width, self.height)
+        clone.cells = [row.copy() for row in self.cells]
+        return clone
+
+    def clear(self, background: Color | None = None) -> None:
+        background = self.background if background is None else background
+        self.background = background
+        if background is None:
+            for row in self.cells:
+                row[:] = self._transparent_row
+            return
+        for row in self.cells:
+            for index, cell in enumerate(row):
+                if cell is TRANSPARENT_CELL:
+                    row[index] = Cell(" ", None, background, False)
+                    continue
+                cell.ch = " "
+                cell.fg = None
+                cell.bg = background
+                cell.bold = False
+
+    def copy_cells_from(self, other: "Canvas") -> None:
+        if self.width != other.width or self.height != other.height:
+            raise ValueError("Canvas sizes must match")
+        self.background = other.background
+        for y in range(self.height):
+            target_row = self.cells[y]
+            source_row = other.cells[y]
+            for x, source in enumerate(source_row):
+                if source is TRANSPARENT_CELL:
+                    target_row[x] = TRANSPARENT_CELL
+                    continue
+                existing = target_row[x]
+                if existing is TRANSPARENT_CELL:
+                    target_row[x] = Cell(source.ch, source.fg, source.bg, source.bold)
+                    continue
+                existing.ch = source.ch
+                existing.fg = source.fg
+                existing.bg = source.bg
+                existing.bold = source.bold
 
     def put(
         self,
@@ -55,7 +116,14 @@ class Canvas:
     ) -> None:
         if 0 <= x < self.width and 0 <= y < self.height and ch:
             existing = self.cells[y][x]
-            self.cells[y][x] = Cell(ch[0], fg_color, existing.bg if bg_color is None else bg_color, bold)
+            bg = existing.bg if bg_color is None else bg_color
+            if existing is TRANSPARENT_CELL:
+                self.cells[y][x] = Cell(ch[0], fg_color, bg, bold)
+                return
+            existing.ch = ch[0]
+            existing.fg = fg_color
+            existing.bg = bg
+            existing.bold = bold
 
     def text(
         self,
@@ -81,14 +149,16 @@ class Canvas:
         alt: Color,
         seed: int,
     ) -> None:
+        glyph_color = Colors.mix(base, alt, 0.4)
+        bg_palette = tuple(Colors.mix(base, alt, step / 12) for step in range(7))
         for row in range(max(0, y), min(self.height, y + height)):
             for col in range(max(0, x), min(self.width, x + width)):
                 value = hash_noise(col, row, seed)
                 if value % 17 == 0:
                     glyph = NOISE_GLYPHS[value % len(NOISE_GLYPHS)]
-                    self.put(col, row, glyph, fg_color=mix(base, alt, 0.4), bg_color=base)
+                    self.put(col, row, glyph, fg_color=glyph_color, bg_color=base)
                 elif self.cells[row][col].ch == " ":
-                    self.cells[row][col].bg = mix(base, alt, ((row + col) % 7) / 12)
+                    self.cells[row][col].bg = bg_palette[(row + col) % 7]
 
     def render(self) -> str:
         parts: list[str] = ["\x1b[H"]
@@ -213,7 +283,7 @@ class Bomb:
         return self.fuse < 0
 
     def render(self, on_screen, put, theme) -> None:
-        tone = mix(theme["enemy"], (255, 150, 150), 0.25)
+        tone = Colors.mix(theme["enemy"], (255, 150, 150), 0.25)
         for wx, wy, ch in self.display_cells():
             if screen := on_screen(wx, wy):
                 put(screen[0], screen[1], ch, fg_color=tone, bold=True)
@@ -407,6 +477,7 @@ class RunState:
     camera_left: int | None = None
     camera_top: int | None = None
     next_object_id: int = 0
+    world: WorldController | None = field(default=None, repr=False, compare=False)
 
     @property
     def head(self) -> Segment:

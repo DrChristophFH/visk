@@ -3,14 +3,42 @@ from __future__ import annotations
 import random
 import string
 import textwrap
+from collections import deque
+
+
+Color = tuple[int, int, int]
+
+
+class Colors:
+    _mix_cache: dict[tuple[Color, Color, float], Color] = {}
+    _mix_cache_order: deque[tuple[Color, Color, float]] = deque()
+    _mix_cache_limit = 512
+
+    @classmethod
+    def mix(cls, a: Color, b: Color, amount: float) -> Color:
+        key = (a, b, amount)
+        cached = cls._mix_cache.get(key)
+        if cached is not None:
+            return cached
+        mixed = (
+            int(a[0] + (b[0] - a[0]) * amount),
+            int(a[1] + (b[1] - a[1]) * amount),
+            int(a[2] + (b[2] - a[2]) * amount),
+        )
+        cls._mix_cache[key] = mixed
+        cls._mix_cache_order.append(key)
+        if len(cls._mix_cache_order) > cls._mix_cache_limit:
+            oldest = cls._mix_cache_order.popleft()
+            cls._mix_cache.pop(oldest, None)
+        return mixed
 
 
 def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-def mix(a: tuple[int, int, int], b: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
-    return tuple(int(a[i] + (b[i] - a[i]) * amount) for i in range(3))
+def mix(a: Color, b: Color, amount: float) -> Color:
+    return Colors.mix(a, b, amount)
 
 
 def fg(rgb: tuple[int, int, int]) -> str:

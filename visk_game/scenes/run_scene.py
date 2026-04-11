@@ -9,9 +9,49 @@ from ..gameplay import active_explosions
 from ..generation import ensure_generated_rect
 from ..models import Canvas, Debris, Enemy, ExplosionEffect, Pickup, RunState, Theme
 from ..scene_types import SceneLayer, SceneRenderResult
-from ..utils import arrow_for_direction, clamp, hash_noise, invert_colors, mix
+from ..utils import Colors, arrow_for_direction, clamp, hash_noise, invert_colors, mix
 from .base import BaseScene
 from .shared import player_segment_color
+
+
+class ChunkSpatialIndex:
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = chunk_size
+        self.buckets: dict[tuple[int, int], set[tuple[int, int]]] = {}
+
+    def clear(self) -> None:
+        self.buckets.clear()
+
+    def add_chunk_points(
+        self, chunk: tuple[int, int], points: set[tuple[int, int]]
+    ) -> None:
+        if points:
+            self.buckets[chunk] = set(points)
+
+    def add_point(self, point: tuple[int, int]) -> None:
+        chunk = point[0] // self.chunk_size, point[1] // self.chunk_size
+        bucket = self.buckets.setdefault(chunk, set())
+        bucket.add(point)
+
+    def remove_point(self, point: tuple[int, int]) -> None:
+        chunk = point[0] // self.chunk_size, point[1] // self.chunk_size
+        bucket = self.buckets.get(chunk)
+        if bucket is None:
+            return
+        bucket.discard(point)
+        if not bucket:
+            self.buckets.pop(chunk, None)
+
+    def iter_rect(self, left: int, top: int, right: int, bottom: int):
+        start_cx = left // self.chunk_size
+        end_cx = (right - 1) // self.chunk_size
+        start_cy = top // self.chunk_size
+        end_cy = (bottom - 1) // self.chunk_size
+        for cy in range(start_cy, end_cy + 1):
+            for cx in range(start_cx, end_cx + 1):
+                for x, y in self.buckets.get((cx, cy), ()):
+                    if left <= x < right and top <= y < bottom:
+                        yield x, y
 
 
 def debris_color(theme: Theme, piece: Debris, *, now: float) -> tuple[int, int, int]:
@@ -38,25 +78,6 @@ def exit_letter_color(theme: Theme, run: RunState, index: int) -> tuple[int, int
     if index in run.extract_matched_indices:
         return mix(theme["bytes"], theme["player"], 0.3)
     return theme["pickup"]
-
-
-def pickup_color_at_position(
-    theme: Theme, run: RunState, position: tuple[int, int]
-) -> tuple[int, int, int] | None:
-    for pickup in run.sector.pickups:
-        if pickup.resolved or pickup.failed:
-            continue
-        for index, cell in enumerate(pickup.cells()):
-            if cell != position:
-                continue
-            if (
-                index in pickup.matched_indices
-                or index in pickup.error_indices
-                or pickup.failed
-            ):
-                return pickup_letter_color(theme, pickup, index)
-            return None
-    return None
 
 
 def failed_pickup_color(theme: Theme) -> tuple[int, int, int]:
@@ -165,6 +186,80 @@ def update_camera(run: RunState, viewport_w: int, viewport_h: int) -> tuple[int,
 class RunScene(BaseScene):
     name = "run"
 
+    def __init__(self, renderer, session) -> None:
+        super().__init__(renderer, session)
+        self.overlay_canvas: Canvas | None = None
+        self.static_canvas: Canvas | None = None
+        self.static_index_sector_id: int | None = None
+        self.static_index_seed: int | None = None
+        self.static_index_chunk_size: int | None = None
+        self.static_index_terrain_revision: int | None = None
+        self.indexed_dot_chunks: set[tuple[int, int]] = set()
+        self.indexed_wall_chunks: set[tuple[int, int]] = set()
+        self.wall_snapshot: set[tuple[int, int]] = set()
+        self.dot_index = ChunkSpatialIndex(1)
+        self.wall_index = ChunkSpatialIndex(1)
+
+    def reset_static_indexes(self, run: RunState) -> None:
+        chunk_size = run.sector.chunk_size
+        self.static_index_sector_id = id(run.sector)
+        self.static_index_seed = run.sector.seed
+        self.static_index_chunk_size = chunk_size
+        self.static_index_terrain_revision = run.sector.terrain_revision
+        self.indexed_dot_chunks.clear()
+        self.indexed_wall_chunks.clear()
+        self.wall_snapshot = set(run.sector.walls)
+        self.dot_index = ChunkSpatialIndex(chunk_size)
+        self.wall_index = ChunkSpatialIndex(chunk_size)
+
+    def index_generated_chunk(self, run: RunState, chunk: tuple[int, int]) -> None:
+        if chunk in self.indexed_wall_chunks and chunk in self.indexed_dot_chunks:
+            return
+        chunk_size = run.sector.chunk_size
+        base_x = chunk[0] * chunk_size
+        base_y = chunk[1] * chunk_size
+        if chunk not in self.indexed_wall_chunks:
+            chunk_walls = {
+                (x, y)
+                for x in range(base_x, base_x + chunk_size)
+                for y in range(base_y, base_y + chunk_size)
+                if (x, y) in run.sector.walls
+            }
+            self.wall_index.add_chunk_points(chunk, chunk_walls)
+            self.indexed_wall_chunks.add(chunk)
+        if chunk not in self.indexed_dot_chunks:
+            chunk_dots = {
+                (x, y)
+                for x in range(base_x, base_x + chunk_size)
+                for y in range(base_y, base_y + chunk_size)
+                if (x, y) not in run.sector.walls
+                and hash_noise(x, y, run.sector.seed) % 73 == 0
+            }
+            self.dot_index.add_chunk_points(chunk, chunk_dots)
+            self.indexed_dot_chunks.add(chunk)
+
+    def ensure_static_indexes(self, run: RunState) -> None:
+        if (
+            self.static_index_sector_id != id(run.sector)
+            or
+            self.static_index_seed != run.sector.seed
+            or self.static_index_chunk_size != run.sector.chunk_size
+        ):
+            self.reset_static_indexes(run)
+        for chunk in run.sector.generated_chunks:
+            self.index_generated_chunk(run, chunk)
+        if self.static_index_terrain_revision == run.sector.terrain_revision:
+            return
+        current_walls = run.sector.walls
+        removed = self.wall_snapshot - current_walls
+        added = current_walls - self.wall_snapshot
+        for wall in removed:
+            self.wall_index.remove_point(wall)
+        for wall in added:
+            self.wall_index.add_point(wall)
+        self.wall_snapshot = set(current_walls)
+        self.static_index_terrain_revision = run.sector.terrain_revision
+
     def render(self, cols: int, rows: int) -> SceneRenderResult:
         run = self.session.run
         if run is None:
@@ -265,25 +360,27 @@ class RunScene(BaseScene):
         self, run: RunState, cols: int, rows: int, left: int, top: int
     ) -> Canvas:
         theme = run.sector.theme
-        canvas = Canvas(cols, rows, theme["bg"])
-        canvas.fill_noise(
-            0, 0, cols, rows, base=theme["bg"], alt=theme["bg_alt"], seed=run.sector.seed
-        )
-        for sx in range(cols):
-            wx = left + sx
-            for sy in range(rows):
-                wy = top + sy
-                base = theme["floor"]
-                if (wx, wy) in run.sector.walls:
-                    glyph = "#" if (wx + wy) % 5 else "+"
-                    canvas.put(sx, sy, glyph, fg_color=theme["wall"], bg_color=base)
-                else:
-                    noise = hash_noise(wx, wy, run.sector.seed)
-                    if noise % 73 == 0:
-                        dot_color = mix(theme["floor"], theme["muted"], 0.8)
-                        canvas.put(sx, sy, ".", fg_color=dot_color, bg_color=base)
-                    else:
-                        canvas.put(sx, sy, " ", bg_color=base)
+        floor = theme["floor"]
+        self.ensure_static_indexes(run)
+        if (
+            self.static_canvas is None
+            or self.static_canvas.width != cols
+            or self.static_canvas.height != rows
+        ):
+            self.static_canvas = Canvas(cols, rows, floor)
+        else:
+            self.static_canvas.clear(background=floor)
+        canvas = self.static_canvas
+        wall = theme["wall"]
+        dot_color = Colors.mix(floor, theme["muted"], 0.8)
+        failed_pickup = failed_pickup_color(theme)
+        right = left + cols
+        bottom = top + rows
+        for wx, wy in self.wall_index.iter_rect(left, top, right, bottom):
+            glyph = "#" if (wx + wy) % 5 else "+"
+            canvas.put(wx - left, wy - top, glyph, fg_color=wall, bg_color=floor)
+        for wx, wy in self.dot_index.iter_rect(left, top, right, bottom):
+            canvas.put(wx - left, wy - top, ".", fg_color=dot_color, bg_color=floor)
         for pickup in run.sector.pickups:
             if pickup.resolved or not pickup.failed:
                 continue
@@ -297,8 +394,8 @@ class RunScene(BaseScene):
                         sx,
                         sy,
                         ch,
-                        fg_color=failed_pickup_color(theme),
-                        bg_color=theme["floor"],
+                        fg_color=failed_pickup,
+                        bg_color=floor,
                     )
         return canvas
 
@@ -306,14 +403,23 @@ class RunScene(BaseScene):
         self, run: RunState, cols: int, rows: int, left: int, top: int
     ) -> Canvas:
         theme = run.sector.theme
-        canvas = Canvas.transparent(cols, rows)
+        if (
+            self.overlay_canvas is None
+            or self.overlay_canvas.width != cols
+            or self.overlay_canvas.height != rows
+        ):
+            self.overlay_canvas = Canvas.transparent(cols, rows)
+        else:
+            self.overlay_canvas.clear()
+        canvas = self.overlay_canvas
         now = time.monotonic()
+        floor = theme["floor"]
+        right = left + cols
+        bottom = top + rows
 
         def on_screen(wx: int, wy: int) -> tuple[int, int] | None:
-            sx = wx - left
-            sy = wy - top
-            if 0 <= sx < cols and 0 <= sy < rows:
-                return sx, sy
+            if left <= wx < right and top <= wy < bottom:
+                return wx - left, wy - top
             return None
 
         def put(x: int, y: int, ch: str, fg_color=None, bg_color=None, bold: bool = False) -> None:
@@ -323,7 +429,7 @@ class RunScene(BaseScene):
                     y,
                     ch,
                     fg_color=fg_color,
-                    bg_color=bg_color if bg_color is not None else theme["floor"],
+                    bg_color=bg_color if bg_color is not None else floor,
                     bold=bold,
                 )
 
@@ -335,7 +441,7 @@ class RunScene(BaseScene):
             ping.render(on_screen, put, theme)
 
         ex, ey = run.sector.exit
-        pulse = 0.25 + 0.25 * (math.sin(time.monotonic() * 3.5) + 1) / 2
+        pulse = 0.25 + 0.25 * (math.sin(now * 3.5) + 1) / 2
         for index, ch in enumerate(EXIT_TEXT):
             if screen := on_screen(ex + index, ey):
                 put(
@@ -356,6 +462,13 @@ class RunScene(BaseScene):
                 if screen := on_screen(pickup.x + i, pickup.y):
                     put(screen[0], screen[1], ch, fg_color=pickup_letter_color(theme, pickup, i))
 
+        pickup_colors = {
+            (pickup.x + index, pickup.y): pickup_letter_color(theme, pickup, index)
+            for pickup in run.sector.pickups
+            if not pickup.resolved and not pickup.failed
+            for index in (pickup.matched_indices | pickup.error_indices)
+        }
+
         for piece in run.wreckage:
             if screen := on_screen(piece.x, piece.y):
                 put(screen[0], screen[1], piece.ch or " ", fg_color=debris_color(theme, piece, now=now))
@@ -366,16 +479,16 @@ class RunScene(BaseScene):
                 if screen := on_screen(segment.x, segment.y):
                     put(screen[0], screen[1], segment.ch, fg_color=enemy_segment_color(theme, enemy, idx))
 
-        blink = int(time.monotonic() * 2.6) % 2 == 0
+        blink = int(now * 2.6) % 2 == 0
         for enemy in active_enemies:
             head_color = enemy_head_color(theme, enemy)
             if screen := on_screen(enemy.head.x, enemy.head.y):
-                flash_fg, flash_bg = invert_colors(head_color, theme["floor"], blink)
+                flash_fg, flash_bg = invert_colors(head_color, floor, blink)
                 put(screen[0], screen[1], enemy.head.ch, fg_color=flash_fg, bg_color=flash_bg)
 
         for idx, segment in enumerate(run.body):
             if screen := on_screen(segment.x, segment.y):
-                pickup_color = pickup_color_at_position(theme, run, (segment.x, segment.y))
+                pickup_color = pickup_colors.get((segment.x, segment.y))
                 color = player_segment_color(
                     theme,
                     idx,
@@ -398,7 +511,7 @@ class RunScene(BaseScene):
             bomb.render(on_screen, put, theme)
 
         if screen := on_screen(run.head.x, run.head.y):
-            cursor_fg, cursor_bg = invert_colors(theme["player"], theme["floor"], blink)
+            cursor_fg, cursor_bg = invert_colors(theme["player"], floor, blink)
             cursor_glyph = run.head.ch if run.head.ch in "^v" else arrow_for_direction(run.direction)
             put(screen[0], screen[1], cursor_glyph, fg_color=cursor_fg, bg_color=cursor_bg)
 

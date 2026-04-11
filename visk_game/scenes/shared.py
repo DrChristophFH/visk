@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..models import SaveData, Theme
-from ..utils import mix
+from ..utils import Colors
 
 
 def save_signature(save: SaveData) -> tuple[object, ...]:
@@ -31,7 +31,7 @@ def player_segment_color(
         else:
             recentness = index / max(1, body_length - 1)
             fade_amount = (1.0 - recentness) * fade_cap
-            color = mix(theme["player"], theme["muted"], fade_amount)
+            color = Colors.mix(theme["player"], theme["muted"], fade_amount)
     if infected:
-        color = mix(color, theme["enemy"], 0.6)
+        color = Colors.mix(color, theme["enemy"], 0.6)
     return color

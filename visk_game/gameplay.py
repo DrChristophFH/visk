@@ -46,6 +46,11 @@ def create_run(save: SaveData) -> RunState:
     inventory["dash"] += save.upgrades["dash_cache"]
     inventory["ping"] += save.upgrades["ping_cache"]
     run = RunState(sector=sector, body=body, direction="right", inventory=inventory, hardcore=save.hardcore)
+    run.world = WorldController(
+        run,
+        active_enemies_for_run=active_enemies_for_run,
+        kill_enemy=kill_enemy,
+    )
     run.log(f"Link established. Sector {sector.name}.")
     show_run_help(run)
     return run
@@ -74,11 +79,13 @@ def create_player_controller(
 
 
 def create_world_controller(run: RunState) -> WorldController:
-    return WorldController(
-        run,
-        active_enemies_for_run=active_enemies_for_run,
-        kill_enemy=kill_enemy,
-    )
+    if run.world is None:
+        run.world = WorldController(
+            run,
+            active_enemies_for_run=active_enemies_for_run,
+            kill_enemy=kill_enemy,
+        )
+    return run.world
 
 
 def add_typed_bytes(run: RunState, amount: int) -> None:

@@ -4,8 +4,6 @@ import random
 import sys
 from collections import deque
 
-from pyinstrument import Profiler
-
 from .audio import AudioManager
 from .constants import DIRECTIONS, SHOP_ITEMS
 from .gameplay import advance_player, create_run, retract_player, tick
@@ -23,7 +21,6 @@ class ViskApp:
         self.rng = random.Random()
         self.renderer = Renderer()
         self.audio = AudioManager()
-        self.profile_next_tick = False
         self.scenes = {
             "menu": MenuScene(self.renderer, self.session),
             "shop": ShopScene(self.renderer, self.session),
@@ -221,9 +218,6 @@ class ViskApp:
         if key == "ESC":
             self.state = "menu"
             return
-        # if key == " ":
-        #     self.profile_next_tick = True
-        #     return
         if key == "BACKSPACE":
             self.run_timed_tick(
                 player_action=lambda: retract_player(self.run),
@@ -244,33 +238,26 @@ class ViskApp:
     ) -> None:
         if self.run is None:
             return
-        profiler = Profiler() if self.profile_next_tick else None
-        if profiler is not None:
-            profiler.start()
-        try:
-            tick(
-                self.run,
-                self.save,
-                self.rng,
-                player_action=player_action,
-                reason=reason,
-            )
-        finally:
-            if profiler is not None:
-                profiler.stop()
-                self.profile_next_tick = False
-                profiler.open_in_browser()
+        tick(
+            self.run,
+            self.save,
+            self.rng,
+            player_action=player_action,
+            reason=reason,
+        )
+
+    def present_current_scene(self) -> None:
+        self.audio.sync_music(self.state, self.save.audio_enabled)
+        frame = self.renderer.present_scene(self.current_scene())
+        if frame:
+            sys.stdout.write(frame)
+            sys.stdout.flush()
 
     def run_loop(self) -> None:
         try:
             with TerminalController() as terminal:
                 while True:
-                    self.audio.sync_music(self.state, self.save.audio_enabled)
-                    frame = self.renderer.present_scene(self.current_scene())
-                    if frame:
-                        sys.stdout.write(frame)
-                        sys.stdout.flush()
-
+                    self.present_current_scene()
                     timeout = 0.08
                     if (
                         self.state == "run"
@@ -293,17 +280,24 @@ class ViskApp:
                                 player_action=None,
                                 reason="idle",
                             )
+                            if self.run is not None and self.run.game_over:
+                                self.finish_run()
                         continue
+
                     self.audio.play_keystroke(True)
                     if self.state == "menu":
                         self.handle_menu_key(key)
-                    elif self.state == "shop":
+                        continue
+                    if self.state == "shop":
                         self.handle_shop_key(key)
-                    elif self.state == "result":
+                        continue
+                    if self.state == "result":
                         self.handle_result_key(key)
-                    elif self.state == "credits":
+                        continue
+                    if self.state == "credits":
                         self.handle_credits_key(key)
-                    elif self.state == "run":
+                        continue
+                    if self.state == "run":
                         self.handle_run_key(key)
                         if self.run is not None and self.run.game_over:
                             self.finish_run()

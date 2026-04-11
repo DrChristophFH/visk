@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 
 from .constants import CREDITS_PAGE_LINES
-from .models import Canvas
+from .models import Canvas, TRANSPARENT_CELL
 from .scene_types import LayerCacheEntry, Scene
 from .utils import wrap_lines
 
@@ -14,6 +14,8 @@ class Renderer:
         self.layer_cache: dict[str, LayerCacheEntry] = {}
         self.viewport_cols = 120
         self.viewport_rows = 38
+        self.frame_buffers: list[Canvas | None] = [None, None]
+        self.next_frame_buffer = 0
 
     def reset_run_cache(self) -> None:
         run_keys = [key for key in self.layer_cache if key.startswith("run.")]
@@ -84,23 +86,50 @@ class Renderer:
         return canvas
 
     def apply_layer(self, target: Canvas, layer: Canvas) -> None:
-        for y in range(min(target.height, layer.height)):
-            for x in range(min(target.width, layer.width)):
-                cell = layer.cells[y][x]
-                if cell.is_transparent():
+        width = min(target.width, layer.width)
+        height = min(target.height, layer.height)
+        for y in range(height):
+            target_row = target.cells[y]
+            layer_row = layer.cells[y]
+            for x in range(width):
+                cell = layer_row[x]
+                if cell is TRANSPARENT_CELL:
                     continue
-                target.cells[y][x] = cell
+                existing = target_row[x]
+                if existing is TRANSPARENT_CELL:
+                    target_row[x] = cell.__class__(cell.ch, cell.fg, cell.bg, cell.bold)
+                    continue
+                existing.ch = cell.ch
+                existing.fg = cell.fg
+                existing.bg = cell.bg
+                existing.bold = cell.bold
+
+    def get_frame_buffer(self, cols: int, rows: int) -> Canvas:
+        canvas = self.frame_buffers[self.next_frame_buffer]
+        if canvas is None or canvas.width != cols or canvas.height != rows:
+            canvas = Canvas.transparent(cols, rows)
+            self.frame_buffers[self.next_frame_buffer] = canvas
+        return canvas
 
     def compose_layers(self, scene: Scene, cols: int, rows: int) -> Canvas:
         render_result = scene.render(cols, rows)
-        canvas = Canvas.transparent(cols, rows)
-        for layer in sorted(render_result.layers, key=lambda item: item.z_index):
-            self.apply_layer(canvas, self.resolve_layer_canvas(layer))
-        return canvas
+        layers = sorted(render_result.layers, key=lambda item: item.z_index)
+        if not layers:
+            return Canvas.transparent(cols, rows)
+        canvas = self.resolve_layer_canvas(layers[0])
+        if len(layers) == 1:
+            return canvas
+        composed = self.get_frame_buffer(cols, rows)
+        composed.copy_cells_from(canvas)
+        for layer in layers[1:]:
+            self.apply_layer(composed, self.resolve_layer_canvas(layer))
+        return composed
 
     def present_scene(self, scene: Scene) -> str:
         cols, rows = self.get_viewport_size()
         canvas = self.compose_layers(scene, cols, rows)
         frame = canvas.render_diff(self.last_canvas)
         self.last_canvas = canvas
+        if canvas is self.frame_buffers[self.next_frame_buffer]:
+            self.next_frame_buffer = 1 - self.next_frame_buffer
         return frame

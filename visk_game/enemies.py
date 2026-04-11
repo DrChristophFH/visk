@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -176,26 +177,93 @@ class EnemyActor:
         if not candidates:
             self.enemy.last_move_mode = "blocked"
             return current
-        if self.rng.random() >= self.enemy.speed_bias:
-            self.enemy.last_move_mode = "random"
-            return self.rng.choice(candidates)
-
-        target = self.behavior.navigation_target(self.run, self.enemy)
-        nav = self.world.get_nav_for_target(*target)
-        guided = [move for move in nav.get_all_moves_from(*current) if move in candidates]
-        if not guided:
-            self.enemy.last_move_mode = "random"
-            return self.rng.choice(candidates)
-        best_distance = min(
-            distance
-            for move in guided
-            if (distance := nav.get_distance(*move)) is not None
-        )
-        best_moves = [
-            move for move in guided if nav.get_distance(*move) == best_distance
+        target = (self.run.head.x, self.run.head.y)
+        safe_moves = [
+            move
+            for move in candidates
+            if self._future_move_is_safe(move, target, lookahead_steps=4)
         ]
-        self.enemy.last_move_mode = "follow"
-        return self.rng.choice(best_moves)
+        considered = safe_moves or candidates
+        best_move = min(
+            considered,
+            key=lambda move: self._move_priority(current, move, target),
+        )
+        self.enemy.last_move_mode = "follow" if safe_moves else "forced"
+        return best_move
+
+    def _move_priority(
+        self,
+        current: tuple[int, int],
+        move: tuple[int, int],
+        target: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        heading = (move[0] - current[0], move[1] - current[1])
+        turn_penalty = 0 if heading == self.enemy.heading else 1
+        return (manhattan(move, target), turn_penalty, move[1], move[0])
+
+    def _future_move_is_safe(
+        self,
+        first_move: tuple[int, int],
+        target: tuple[int, int],
+        *,
+        lookahead_steps: int,
+    ) -> bool:
+        simulated_body = deque((segment.x, segment.y) for segment in self.enemy.body)
+        current = self.head_position()
+        heading = self.enemy.heading
+
+        for step in range(lookahead_steps):
+            next_pos = (
+                first_move
+                if step == 0
+                else self._future_best_move(current, simulated_body, target, heading)
+            )
+            if next_pos is None:
+                return False
+            heading = (next_pos[0] - current[0], next_pos[1] - current[1])
+            should_grow = self.grow and len(simulated_body) <= MAX_ENEMY_LENGTH
+            simulated_body.append(next_pos)
+            if not should_grow:
+                simulated_body.popleft()
+            current = next_pos
+
+        return True
+
+    def _future_best_move(
+        self,
+        current: tuple[int, int],
+        simulated_body: deque[tuple[int, int]],
+        target: tuple[int, int],
+        heading: tuple[int, int],
+    ) -> tuple[int, int] | None:
+        candidates = self._future_candidate_moves(current, simulated_body)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda move: (
+                manhattan(move, target),
+                0 if (move[0] - current[0], move[1] - current[1]) == heading else 1,
+                move[1],
+                move[0],
+            ),
+        )
+
+    def _future_candidate_moves(
+        self,
+        current: tuple[int, int],
+        simulated_body: deque[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        own_cells = set(simulated_body)
+        candidates: list[tuple[int, int]] = []
+        for dx, dy in DIRECTIONS.values():
+            nxt = current[0] + dx, current[1] + dy
+            if not self.world.is_generated_cell(*nxt):
+                continue
+            if nxt in self.run.sector.walls or nxt in own_cells:
+                continue
+            candidates.append(nxt)
+        return candidates
 
     def _candidate_moves(
         self, current: tuple[int, int]

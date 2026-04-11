@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..constants import RUN_ART, THEMES
 from ..models import Canvas
 from ..scene_types import SceneLayer, SceneRenderResult
-from ..utils import mix, wrap_lines
+from ..utils import Colors, wrap_lines
 from .base import BaseScene
 from .shared import save_signature
 
@@ -30,14 +30,16 @@ class MenuScene(BaseScene):
         top = max(2, rows // 2 - 12)
         art_width = max(len(line) for line in RUN_ART)
         left = max(2, (cols - art_width) // 2)
+        art_colors = [
+            Colors.mix(theme["accent"], theme["player"], i / max(1, len(RUN_ART) - 1))
+            for i in range(len(RUN_ART))
+        ]
         for i, line in enumerate(RUN_ART):
             canvas.text(
                 left,
                 top + i,
                 line,
-                fg_color=mix(
-                    theme["accent"], theme["player"], i / max(1, len(RUN_ART) - 1)
-                ),
+                fg_color=art_colors[i],
                 bold=True,
             )
         summary = (
