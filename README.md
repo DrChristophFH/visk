@@ -6,6 +6,26 @@ Concepts:
 - Protocols are passive modifiers
 - Shells define starting loadouts
 
+Runs consist of an endless amount of stages. Not every stage spawns an extract. 
+
+## Enemies
+
+### CHASER
+
+A persistent hunter that tracks your coordinates across the grid.
+
+### VIRUS
+
+Infects your trail of characters, draining the Bytes you’ve collected for extraction.
+
+### BLINDER
+
+Corrupts your visual feed, forcing you to type and execute commands by feel for a temporary duration.
+
+### FUSE
+
+ Similar to a Chaser, but triggers a catastrophic explosion when it nears your trail.
+
 ## Commands
 
 ### Basic Commands
@@ -19,6 +39,30 @@ Concepts:
   - `red`
   - `green`
   - `blue`
+
+### ZAP
+
+Deletes the closest enemy instantly.
+
+### BOMB
+
+Sets an explosive with a short fuse.
+
+### MINE
+
+Deploys a proximity trap for trailing enemies.
+
+### SILENCE
+
+Pauses all enemy movement for 20 steps.
+
+### PING
+
+Shows the direction to the thing that was pinged. What is pingable depends on the protocols the player has. By default only the `extract` is pingable via `ping_extract`.
+
+### DASH
+
+Teleports the player by pressing the TAB key.
 
 ## Protocols
 
