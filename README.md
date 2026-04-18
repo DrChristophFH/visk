@@ -1,6 +1,59 @@
 # Visk
 
-Concepts:
+- You have a cursor (head) position on the grid
+- Each character typed is not stored in an input buffer. It is placed into the world as a new body segment
+- The newly typed character is appended spatially relative to the body, typing grows your trail
+- Because of that, the command you are typing is also the geometry you are creating
+
+## Example
+
+Initial:
+```
+>
+```
+
+Type p:
+```
+p>
+```
+
+Type u:
+```
+pu>
+```
+
+Then type another p:
+```
+pup^
+```
+
+Type r:
+
+```
+   ^
+pupr
+```
+
+Then type i, resulting in:
+
+```
+   ^
+   i
+pupr
+```
+
+Eventually you will have something like:
+
+```
+   wow_this_is_cool_downn
+   t                    i
+   h                    c
+   g                    e
+   i                    v
+pupr
+```
+
+## Concepts
 
 - Commands are active abilities
 - Protocols are passive modifiers
@@ -100,6 +153,10 @@ When your trail would collide with itself at the head, it bends into the nearest
 ### route_lint
 
 Changes the player cursor to alert how many characters are left before there is no option to turn away from the upcomming wall. Turns visibly red when this is the last possible moment to start typing the direction.
+
+### rollback
+
+The first backspace after completing a valid command removes the whole command token instead of one character.
 
 ## Map Elements
 
